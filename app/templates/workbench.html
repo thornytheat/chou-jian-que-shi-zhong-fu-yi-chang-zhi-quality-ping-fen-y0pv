@@ -15,7 +15,7 @@
     <h1 class="page-title">抽检工作台</h1>
     <p class="page-sub">
       两种输入任选其一：内置样例（{{ sample_rows }} 行 × {{ column_specs|length }} 列）或上传自己的 CSV（列名必须与规则集一致）。
-      执行后按 {{ stages|length }} 个阶段推进，完成后自动跳结果页；错误输入会返回明确原因，不会静默跳过。
+      导入按数据分片处理：坏记录单独隔离并注明原因，单片失败可从已确认处续跑，全部分片核对相符后才统一发布分数、异常组与工单。
     </p>
   </div>
 </div>
@@ -26,13 +26,17 @@
   <section class="panel pane-sticky" id="task">
     <div class="panel-head">
       <h2>抽检任务</h2>
-      <div class="panel-actions"><span class="tag">{{ stages|length }} 阶段</span></div>
+      <div class="panel-actions"><span class="tag">分片导入</span></div>
     </div>
     <div class="panel-body">
       <form id="upload-form" data-endpoint="/api/runs/upload" enctype="multipart/form-data">
         <div class="field">
           <label for="file">上传 CSV（UTF-8 / GB18030 自动识别）</label>
           <input type="file" id="file" name="file" accept=".csv,text/csv">
+        </div>
+        <div class="field">
+          <label for="shard-size-upload">分片大小（每片记录数，{{ 50 }}~{{ 5000 }}，默认 {{ default_shard_size }}）</label>
+          <input type="number" id="shard-size-upload" name="shard_size" min="50" max="5000" step="50" value="{{ default_shard_size }}">
         </div>
       </form>
 
@@ -57,16 +61,20 @@
           <label for="csv-text">CSV 文本（含表头）</label>
           <textarea id="csv-text" placeholder="row_id,product_id,category,price,stock,weight,supplier,updated_at,rating"></textarea>
         </div>
-        <p class="small muted" style="margin:0">有 <code>row_id</code> 才算一行；缺列会直接 400 并列出缺失的列名。</p>
+        <div class="field">
+          <label for="shard-size-text">分片大小（每片记录数）</label>
+          <input type="number" id="shard-size-text" min="50" max="5000" step="50" value="{{ default_shard_size }}">
+        </div>
+        <p class="small muted" style="margin:0">有 <code>row_id</code> 才算一行；缺列表头直接 400，行级坏数据进隔离区并写明原因。</p>
       </details>
 
       <details class="help" style="margin-top:8px">
-        <summary>输入校验与错误恢复口径</summary>
+        <summary>输入校验与失败恢复口径</summary>
         <ul class="list small" style="margin:6px 0 0">
-          <li>缺列 → 400：<code>CSV 缺少必需列：price、stock…</code>，页面可直接改文件重试，无需刷新。</li>
-          <li>空文件 / 只有表头 → 400：<code>上传的文件为空</code> / <code>CSV 只有表头、没有数据行</code>。</li>
-          <li>超过 8MB → 400，请分批抽检。</li>
-          <li>上传与粘贴都不写回上游数据，只写本次运行的报告快照。</li>
+          <li>表头缺列 / 重复列名 / 空文件 → 400：页面可直接改文件重试，无需刷新。</li>
+          <li>记录级坏数据（字段数不符、row_id 为空或重复、空白行）→ 隔离区，带原因码与行号，不静默跳过。</li>
+          <li>单片处理失败 → 该批不重来：已确认片保留，点「从已确认处续跑」只重做失败片，不重复计数。</li>
+          <li>全部分片确认且 <code>源 = 健康 + 隔离</code> 核对相符后才统一发布；失败期间线上保留旧版分数与工单。</li>
         </ul>
       </details>
     </div>
@@ -146,23 +154,65 @@
 
     <section class="panel" id="m2">
       <div class="panel-head">
-        <h2>剖析进度（{{ stages|length }} 个阶段）</h2>
+        <h2>分片进度与发布状态</h2>
         <div class="panel-actions"><span class="tag" id="progress-state">待执行</span></div>
       </div>
-      <div id="progress-card">
+      <div id="progress-card" hidden>
         <div class="panel-body tight">
           <div class="progress"><div class="progress-bar" id="progress-bar" style="width:0%"></div></div>
           <p class="small" id="progress-text" style="margin:0">尚未执行：点左侧面板底部「执行剖析（样例数据）」或上传 CSV 开始。</p>
+          <div class="small muted" id="shard-summary" style="margin-top:6px"></div>
         </div>
-        <ul class="stages" id="stage-list" style="margin:0;padding:10px 14px 14px">
-          {% for stage in stages %}<li data-stage="{{ loop.index0 }}">{{ stage }}</li>{% endfor %}
-        </ul>
+        <div class="table-wrap roomy" style="padding:0 14px 10px">
+          <table class="dense" id="shard-list-table" hidden>
+            <thead><tr><th>分片</th><th>状态</th><th>源记录</th><th>健康</th><th>隔离</th><th>尝试</th></tr></thead>
+            <tbody id="shard-list-body"></tbody>
+          </table>
+        </div>
+        <div class="panel-actions" id="resume-row" hidden>
+          <button type="button" class="btn small" id="resume-btn">从已确认处续跑</button>
+          <span class="small muted" style="align-self:center">已确认分片不会重跑，失败片重试不会重复计数。</span>
+        </div>
       </div>
       <div class="panel-actions">
         <span class="small muted" style="align-self:center">
-          载入 → 缺失 → 重复 → 异常 → 类型与范围校验 → 加权评分 → 告警合并；每步都是纯函数，同一输入同一分数。
+          逐片确认（健康行 + 隔离记录同事务落库）→ 全片确认后跑 7 阶段剖析 → 核对 <code>源 = 健康 + 隔离</code> → 原子发布。
         </span>
       </div>
+    </section>
+
+    <section class="panel" id="m-publish">
+      <div class="panel-head">
+        <h2>当前已发布版本与工单去向</h2>
+        <div class="panel-actions">
+          {% if published %}<span class="tag ok">线上生效中</span>{% else %}<span class="tag warn">尚未发布</span>{% endif %}
+        </div>
+      </div>
+      {% if published %}
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>运行</th><th>发布时间</th><th>源/健康/隔离</th><th>分数</th><th>分级</th><th>工单</th><th>隔离清单</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><a href="/result/{{ published.run_id }}"><code>{{ published.run_id }}</code></a></td>
+              <td class="small nowrap">{{ published.published_at }}</td>
+              <td class="small">{{ published.source_rows }} / {{ published.healthy_rows }} / {{ published.quarantine_rows }}</td>
+              <td>{{ published.total_score|num(2) }}</td>
+              <td><span class="tag {% if published.grade == 'A' %}ok{% elif published.grade == 'B' %}warn{% else %}err{% endif %}">{{ published.grade }}</span></td>
+              <td class="small"><a href="/api/runs/{{ published.run_id }}/alerts.csv">工单 CSV</a></td>
+              <td class="small"><a href="/api/runs/{{ published.run_id }}/quarantine.csv">隔离 CSV</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-actions">
+        <span class="small muted" style="align-self:center">
+          新作业全部核对通过并发布前，分数、异常组与工单都保持这一版；失败期间下载到的仍是旧版，不会混入半成品结果。
+        </span>
+      </div>
+      {% else %}
+      <div class="empty">还没有已发布版本。执行一次分片作业并通过核对后，这里会显示线上版本与工单下载入口。</div>
+      {% endif %}
     </section>
 
     <section class="panel" id="m3">
@@ -246,28 +296,41 @@
       </div>
       <div class="table-wrap">
         <table class="dense">
-          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>行数</th><th>总分</th><th>分级</th><th>状态</th><th>工单 CSV</th></tr></thead>
+          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>源/健康/隔离</th><th>分片</th><th>总分</th><th>分级</th><th>状态</th><th>发布</th><th>工单 / 隔离</th></tr></thead>
           <tbody>
             {% for item in history %}
             <tr>
               <td><a href="/result/{{ item.run_id }}">{{ item.run_id }}</a></td>
               <td class="small muted nowrap">{{ item.created_at }}</td>
               <td class="small cell-ellipsis">{{ item.source }}</td>
-              <td>{{ item.rows or '—' }}</td>
+              <td class="small">{{ item.source_rows }} / {{ item.healthy_rows }} / {{ item.quarantine_rows }}</td>
+              <td class="small">{{ item.confirmed_shards }}/{{ item.shard_count or '—' }}</td>
               <td>{% if item.total_score is not none %}{{ item.total_score|num(2) }}{% else %}—{% endif %}</td>
               <td>{% if item.grade %}<span class="tag {% if item.grade == 'A' %}ok{% elif item.grade == 'B' %}warn{% else %}err{% endif %}">{{ item.grade }}</span>{% else %}—{% endif %}</td>
-              <td class="small">{{ item.stage }}</td>
-              <td class="small">{% if item.status == 'done' %}<a href="/api/runs/{{ item.run_id }}/alerts.csv">下载</a>{% else %}—{% endif %}</td>
+              <td class="small">
+                {% if item.status == 'failed' %}<span class="tag err">失败</span>
+                {% elif item.status == 'running' %}<span class="tag warn">运行中</span>
+                {% else %}<span class="tag ok">完成</span>{% endif %}
+                <span class="muted">{{ item.stage }}</span>
+              </td>
+              <td class="small">
+                {% if item.publish_status == 'published' %}<span class="tag ok">已发布</span>
+                {% else %}<span class="tag warn">未发布</span>{% endif %}
+              </td>
+              <td class="small nowrap">
+                {% if item.publish_status == 'published' %}<a href="/api/runs/{{ item.run_id }}/alerts.csv">工单</a>{% else %}—{% endif %}
+                {% if item.quarantine_rows %} · <a href="/api/runs/{{ item.run_id }}/quarantine.csv">隔离</a>{% endif %}
+              </td>
             </tr>
             {% else %}
-            <tr><td colspan="8" class="muted">暂无记录。执行一次抽检后，这里会按时间倒序列出运行与工单下载入口。</td></tr>
+            <tr><td colspan="10" class="muted">暂无记录。执行一次抽检后，这里会按时间倒序列出运行、发布状态与工单/隔离下载入口。</td></tr>
             {% endfor %}
           </tbody>
         </table>
       </div>
       <div class="panel-actions">
         <span class="small muted" style="align-self:center">
-          整改工单 CSV 字段：工单号 / row_id / column / rules / severity / 当前值 / 问题说明 / 整改建议；缺失违规按前 20 行逐行 + 其余按列汇总。
+          工单 CSV 仅对已发布作业开放；隔离 CSV 含每条坏记录的行号、原因码、原因说明与原始内容，可退回上游修正。
         </span>
       </div>
     </section>

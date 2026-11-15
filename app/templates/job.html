@@ -1,0 +1,309 @@
+{% extends "base.html" %}
+{% block title %}分片作业 {{ run.run_id }} · {{ app_name }}{% endblock %}
+{% block crumb %}分片作业{% endblock %}
+{% block meta %}
+<span class="dot {% if run.status == 'failed' %}err{% elif run.publish_status == 'published' %}ok{% else %}warn{% endif %}"></span>
+{{ run.stage }}
+{% endblock %}
+{% block actions %}
+<a class="btn secondary small" href="/workbench">回工作台</a>
+{% if published %}<a class="btn small secondary" href="/api/runs/{{ published.run_id }}/alerts.csv">下载当前已发布工单（旧版）</a>{% endif %}
+{% endblock %}
+{% block status_left %}坏记录单独隔离并注明原因 · 已确认分片不重跑、不重复计数 · 全部核对相符后才统一发布{% endblock %}
+{% block status_right %}run_id <code>{{ run.run_id }}</code>{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">分片作业 · {{ run.run_id }}</h1>
+    <p class="page-sub">
+      数据源 {{ run.source }} · 源记录 <strong>{{ run.source_rows }}</strong> 条 =
+      健康 <strong>{{ run.healthy_rows }}</strong> 条 + 隔离 <strong>{{ run.quarantine_rows }}</strong> 条 ·
+      共 {{ run.shard_count }} 片（每片 ≤ {{ run.shard_size }} 条）· 创建于 {{ run.created_at }}
+    </p>
+  </div>
+  <div class="page-head-actions">
+    {% if run.status == 'failed' %}
+    <button type="button" class="btn" id="resume-btn" data-run="{{ run.run_id }}">从已确认处续跑</button>
+    {% endif %}
+    <a class="btn secondary" href="/api/runs/{{ run.run_id }}/quarantine.csv">下载隔离记录 CSV</a>
+  </div>
+</div>
+
+<div class="alert alert-error" id="job-error" {% if not run.error %}hidden{% endif %} role="alert">
+  {% if run.error %}{{ run.error }}{% endif %}
+</div>
+
+{# ---------------- 状态总览 KPI ---------------- #}
+<div class="kpi-strip">
+  <div class="kpi">
+    <div class="k-label">分片进度</div>
+    <div class="k-value">{{ run.confirmed_shards }}/{{ run.shard_count }}</div>
+    <div class="k-note">已确认 / 总片数</div>
+  </div>
+  <div class="kpi {% if run.quarantine_rows %}warn{% else %}ok{% endif %}">
+    <div class="k-label">隔离记录</div>
+    <div class="k-value">{{ quarantine_total }}</div>
+    <div class="k-note">坏记录不静默跳过，均带原因</div>
+  </div>
+  <div class="kpi ok">
+    <div class="k-label">健康记录</div>
+    <div class="k-value">{{ run.healthy_rows }}</div>
+    <div class="k-note">参与评分/异常/工单</div>
+  </div>
+  <div class="kpi {% if run.publish_status == 'published' %}ok{% elif run.status == 'failed' %}err{% else %}warn{% endif %}">
+    <div class="k-label">发布状态</div>
+    <div class="k-value" style="font-size:20px">
+      {% if run.publish_status == 'published' %}已发布
+      {% elif run.status == 'failed' %}未发布（保留旧版）
+      {% else %}待发布{% endif %}
+    </div>
+    <div class="k-note">
+      {% if run.published_at %}{{ run.published_at }}
+      {% elif published %}当前线上仍是旧版 {{ published.run_id }}
+      {% else %}尚无已发布版本{% endif %}
+    </div>
+  </div>
+  <div class="kpi">
+    <div class="k-label">工单去向</div>
+    <div class="k-value" style="font-size:16px">
+      {% if run.publish_status == 'published' %}本作业工单
+      {% elif published %}旧版 {{ published.run_id }}
+      {% else %}暂不可下发{% endif %}
+    </div>
+    <div class="k-note">
+      {% if run.publish_status == 'published' %}<a href="/api/runs/{{ run.run_id }}/alerts.csv">下载 WO 工单 CSV</a>
+      {% elif published %}<a href="/api/runs/{{ published.run_id }}/alerts.csv">下载旧版工单 CSV</a>
+      {% else %}发布后才生成工单{% endif %}
+    </div>
+  </div>
+</div>
+
+{# ---------------- 分片进度 ---------------- #}
+<section class="panel">
+  <div class="panel-head">
+    <h2>分片进度（失败片可续跑，已确认片不重做）</h2>
+    <div class="panel-actions"><span class="tag" id="shard-state-tag">{{ run.stage }}</span></div>
+  </div>
+  <div class="panel-body tight">
+    <div class="progress"><div class="progress-bar" id="shard-progress-bar"
+      style="width:{% if run.shard_count %}{{ (run.confirmed_shards / run.shard_count * 100)|round(0) }}{% else %}0{% endif %}%"></div></div>
+    <p class="small muted" style="margin:0" id="shard-progress-text">
+      已确认 {{ run.confirmed_shards }} / {{ run.shard_count }} 片；
+      每片在独立事务内落库，处理失败整体回滚，续跑时只重做未确认片，计数不重复。
+    </p>
+  </div>
+  <div class="table-wrap roomy">
+    <table class="dense" id="shard-table">
+      <thead>
+        <tr><th>分片</th><th>状态</th><th>源记录</th><th>健康</th><th>隔离</th><th>尝试次数</th><th>确认时间 / 失败原因</th></tr>
+      </thead>
+      <tbody>
+        {% for s in shards %}
+        <tr data-shard="{{ s.shard_index }}">
+          <td>第 {{ s.shard_index + 1 }} 片</td>
+          <td><span class="tag shard-status {% if s.status == 'confirmed' %}ok{% elif s.status == 'failed' %}err{% elif s.status == 'processing' %}warn{% endif %}">
+            {{ {'pending': '待处理', 'processing': '处理中', 'confirmed': '已确认', 'failed': '失败'}.get(s.status, s.status) }}
+          </span></td>
+          <td>{{ s.total_records }}</td>
+          <td>{{ s.healthy_records }}</td>
+          <td>{{ s.quarantine_records }}</td>
+          <td class="attempts">{{ s.attempts }}</td>
+          <td class="small muted">
+            {% if s.status == 'confirmed' %}{{ s.confirmed_at }}
+            {% elif s.last_error %}<span class="err-text">{{ s.last_error }}</span>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{# ---------------- 记录核对恒等式 ---------------- #}
+<section class="panel">
+  <div class="panel-head">
+    <h2>记录核对（发布闸门）</h2>
+    <div class="panel-actions">
+      <span class="tag {% if run.source_rows == run.healthy_rows + run.quarantine_rows %}ok{% else %}err{% endif %}" id="reconcile-tag">
+        {% if run.source_rows == run.healthy_rows + run.quarantine_rows %}核对相符{% else %}核对不符{% endif %}
+      </span>
+    </div>
+  </div>
+  <div class="panel-body tight">
+    <p class="small" style="margin:0 0 8px">
+      发布条件：全部分片 <strong>confirmed</strong> 且
+      <code>源记录数 ({{ run.source_rows }}) = 健康 ({{ run.healthy_rows }}) + 隔离 ({{ run.quarantine_rows }})</code>。
+      核对不通过时作业失败，<strong>不切换发布指针，线上保留旧版分数、异常组与工单</strong>。
+    </p>
+    {% if reason_summary %}
+    <p class="small muted" style="margin:0">隔离原因分布：
+      {% for item in reason_summary %}
+      <span class="tag warn">{{ reason_labels.get(item.reason_code, item.reason_code) }} × {{ item.count }}</span>
+      {% endfor %}
+    </p>
+    {% endif %}
+  </div>
+</section>
+
+{# ---------------- 隔离记录 ---------------- #}
+<section class="panel">
+  <div class="panel-head">
+    <h2>隔离记录（{{ quarantine_total }} 条，坏记录不再静默跳过）</h2>
+    <div class="panel-actions">
+      <span class="tag">显示前 {{ quarantine_shown }} 条</span>
+      <a class="btn secondary small" href="/api/runs/{{ run.run_id }}/quarantine.csv">下载全部隔离 CSV</a>
+    </div>
+  </div>
+  {% if quarantine_items %}
+  <div class="table-wrap roomy">
+    <table class="dense">
+      <thead><tr><th>源文件行号</th><th>分片</th><th>row_id</th><th>原因码</th><th>原因说明</th><th>原始内容</th></tr></thead>
+      <tbody>
+        {% for q in quarantine_items %}
+        <tr>
+          <td>{{ q.line_no }}</td>
+          <td>第 {{ q.shard_index + 1 }} 片</td>
+          <td><code>{{ q.row_id or '—' }}</code></td>
+          <td><span class="tag err">{{ q.reason_code }}</span></td>
+          <td class="small">{{ q.reason }}</td>
+          <td class="small muted cell-ellipsis" title="{{ q.raw_text }}">{{ q.raw_text }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">本次导入没有坏记录，全部 {{ run.source_rows }} 条源记录均为健康记录。</div>
+  {% endif %}
+</section>
+
+{# ---------------- 发布状态与工单去向 ---------------- #}
+<section class="panel">
+  <div class="panel-head">
+    <h2>发布状态与工单去向</h2>
+    <div class="panel-actions">
+      {% if run.publish_status == 'published' %}<span class="tag ok">当前线上版本</span>
+      {% else %}<span class="tag warn">未发布</span>{% endif %}
+    </div>
+  </div>
+  <div class="table-wrap auto">
+    <table class="dense">
+      <thead><tr><th>版本</th><th>运行</th><th>发布时间</th><th>分数 / 分级</th><th>工单</th><th>状态</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>本次作业</td>
+          <td><code>{{ run.run_id }}</code></td>
+          <td class="small">{{ run.published_at or '—' }}</td>
+          <td>{% if run.total_score is not none %}{{ run.total_score|num(2) }} · {{ run.grade }}{% else %}—{% endif %}</td>
+          <td class="small">
+            {% if run.publish_status == 'published' %}<a href="/api/runs/{{ run.run_id }}/alerts.csv">WO 工单 CSV</a>
+            {% else %}未发布，不可下发{% endif %}
+          </td>
+          <td><span class="tag {% if run.publish_status == 'published' %}ok{% elif run.status == 'failed' %}err{% else %}warn{% endif %}">
+            {{ {'unpublished': '待发布', 'published': '已发布'}.get(run.publish_status, run.publish_status) }}
+          </span></td>
+        </tr>
+        {% if published and published.run_id != run.run_id %}
+        <tr>
+          <td>线上旧版（失败期间保留）</td>
+          <td><a href="/result/{{ published.run_id }}"><code>{{ published.run_id }}</code></a></td>
+          <td class="small">{{ published.published_at }}</td>
+          <td>{{ published.total_score|num(2) }} · {{ published.grade }}</td>
+          <td class="small"><a href="/api/runs/{{ published.run_id }}/alerts.csv">旧版工单 CSV</a></td>
+          <td><span class="tag ok">线上生效中</span></td>
+        </tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+  <div class="panel-actions">
+    <span class="small muted" style="align-self:center">
+      分数、异常组与工单只在全部分片处理完成且核对相符后统一发布；发布是原子切换，失败期间任何人下载到的都是上一版已发布工单。
+    </span>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var runId = {{ run.run_id|tojson }};
+  var statusMap = {pending: '待处理', processing: '处理中', confirmed: '已确认', failed: '失败'};
+  var bar = document.getElementById('shard-progress-bar');
+  var text = document.getElementById('shard-progress-text');
+  var tag = document.getElementById('shard-state-tag');
+  var errBox = document.getElementById('job-error');
+  var resumeBtn = document.getElementById('resume-btn');
+  var polling = false;
+
+  async function getJSON(url) {
+    var res = await fetch(url);
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.detail || ('请求失败：' + res.status));
+    return data;
+  }
+
+  function renderShards(shards) {
+    shards.forEach(function (s) {
+      var tr = document.querySelector('tr[data-shard="' + s.shard_index + '"]');
+      if (!tr) return;
+      var cls = s.status === 'confirmed' ? 'ok' : (s.status === 'failed' ? 'err' : (s.status === 'processing' ? 'warn' : ''));
+      tr.querySelector('.shard-status').className = 'tag shard-status ' + cls;
+      tr.querySelector('.shard-status').textContent = statusMap[s.status] || s.status;
+      tr.querySelector('.attempts').textContent = s.attempts;
+    });
+  }
+
+  async function poll() {
+    if (polling) return;
+    polling = true;
+    try {
+      var st = await getJSON('/api/runs/' + runId + '/status');
+      if (tag) tag.textContent = st.stage;
+      if (st.shard_count) {
+        var pct = Math.round(st.confirmed_shards / st.shard_count * 100);
+        if (bar) bar.style.width = pct + '%';
+      }
+      if (text) {
+        text.textContent = '已确认 ' + st.confirmed_shards + ' / ' + st.shard_count +
+          ' 片 · 源 ' + st.source_rows + ' = 健康 ' + st.healthy_rows + ' + 隔离 ' + st.quarantine_rows;
+      }
+      renderShards(st.shards || []);
+      if (st.error && errBox) { errBox.hidden = false; errBox.textContent = st.error; }
+      if (st.status === 'failed') {
+        if (resumeBtn) resumeBtn.hidden = !st.resumable;
+        return; // 停止轮询，等用户点续跑
+      }
+      if (st.status === 'done' && st.publish_status === 'published') {
+        window.location.href = st.result_url;
+        return;
+      }
+      setTimeout(poll, 500);
+    } catch (e) {
+      setTimeout(poll, 1500);
+    } finally {
+      polling = false;
+    }
+  }
+
+  if (resumeBtn) {
+    resumeBtn.addEventListener('click', async function () {
+      resumeBtn.disabled = true;
+      try {
+        await fetch('/api/runs/' + runId + '/resume', {method: 'POST'});
+        if (errBox) errBox.hidden = true;
+        resumeBtn.hidden = true;
+        poll();
+      } catch (e) {
+        resumeBtn.disabled = false;
+        if (errBox) { errBox.hidden = false; errBox.textContent = '续跑失败：' + e.message; }
+      }
+    });
+  }
+
+  if ({{ 'true' if run.status == 'running' else 'false' }}) poll();
+})();
+</script>
+{% endblock %}

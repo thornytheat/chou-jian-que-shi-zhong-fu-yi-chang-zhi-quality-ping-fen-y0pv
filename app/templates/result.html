@@ -2,28 +2,33 @@
 {% block title %}抽检结果 {{ run.run_id }} · {{ app_name }}{% endblock %}
 {% block crumb %}抽检结果{% endblock %}
 {% block meta %}<span class="dot {% if score.total >= score.thresholds.B %}ok{% else %}warn{% endif %}"></span>
-总分 {{ score.total|num(2) }} · 分级 {{ score.grade }} · {{ report.dataset.rows }} 行{% endblock %}
+已发布版本 · 总分 {{ score.total|num(2) }} · 分级 {{ score.grade }} · 健康 {{ run.healthy_rows }} 行 / 隔离 {{ run.quarantine_rows }} 行{% endblock %}
 {% block actions %}
 <a class="btn secondary small" href="/workbench">再抽检一次</a>
 <a class="btn secondary small" href="/review">去复核页改权重</a>
 <a class="btn small" href="/api/runs/{{ run.run_id }}/alerts.csv">下载工单 CSV</a>
 {% endblock %}
-{% block status_left %}规则集 v{{ report.dataset.rule_version }} · 业务键 {{ report.dataset.business_key|join(' + ') }} · 耗时 {{ report.elapsed_ms|num(1) }} ms · 同一输入可复现{% endblock %}
+{% block status_left %}规则集 v{{ report.dataset.rule_version }} · 业务键 {{ report.dataset.business_key|join(' + ') }} · 耗时 {{ report.elapsed_ms|num(1) }} ms · 同一输入可复现 · 发布于 {{ run.published_at }}{% endblock %}
 {% block status_right %}run_id <code>{{ run.run_id }}</code>{% endblock %}
 
 {% block content %}
 <div class="page-head">
   <div>
-    <h1 class="page-title">抽检结果 · {{ run.run_id }}</h1>
+    <h1 class="page-title">抽检结果 · {{ run.run_id }} <span class="tag ok" style="vertical-align:middle">已发布版本</span></h1>
     <p class="page-sub">
       数据源 {{ report.dataset.source }} · 编码 {{ report.dataset.encoding }} ·
-      {{ report.dataset.rows }} 行 × {{ report.dataset.columns }} 列 · 规则集 v{{ report.dataset.rule_version }} ·
+      源记录 <strong>{{ report.dataset.source_rows }}</strong> 条 = 健康 <strong>{{ report.dataset.healthy_rows }}</strong> 条 + 隔离 <strong>{{ report.dataset.quarantine_rows }}</strong> 条 ·
+      规则集 v{{ report.dataset.rule_version }} ·
       业务键 {{ report.dataset.business_key|join(' + ') }} · 执行于 {{ run.created_at }} · 耗时 {{ report.elapsed_ms|num(1) }} ms
       <br>
       加权总分 <strong>{{ score.total|num(2) }}</strong>（分级
       <span class="tag {% if score.grade == 'A' %}ok{% elif score.grade == 'B' %}warn{% else %}err{% endif %}">{{ score.grade }}</span>，
       阈 A≥{{ score.thresholds.A }} / B≥{{ score.thresholds.B }} / C≥{{ score.thresholds.C }}）；
       共 {{ alerts_total }} 条告警，同一 <code>(row_id, column)</code> 只保留一条并合并全部命中规则。
+      {% if report.dataset.quarantine_rows %}
+      <br><span class="tag warn">{{ report.dataset.quarantine_rows }} 条坏记录已隔离</span>
+      不参与评分与工单，<a href="/api/runs/{{ run.run_id }}/quarantine.csv">下载隔离记录 CSV</a> 查看每条原因。
+      {% endif %}
     </p>
   </div>
 </div>
@@ -53,6 +58,11 @@
     <div class="k-label">样本不足</div>
     <div class="k-value">{{ insufficient|length }}</div>
     <div class="k-note">列 × 分组 · 组内样本 &lt; {{ report.outliers.min_sample }} 不判异常</div>
+  </div>
+  <div class="kpi {% if report.dataset.quarantine_rows %}warn{% else %}ok{% endif %}">
+    <div class="k-label">隔离坏记录</div>
+    <div class="k-value">{{ report.dataset.quarantine_rows }}</div>
+    <div class="k-note">不评分 · <a href="/api/runs/{{ run.run_id }}/quarantine.csv">隔离 CSV</a></div>
   </div>
 </div>
 

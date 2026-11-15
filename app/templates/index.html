@@ -70,7 +70,7 @@
         </p>
         <p>
           <a class="btn secondary small" href="/review">改权重并重算</a>
-          {% if latest and latest.status == 'done' %}<a class="btn secondary small" href="/api/runs/{{ latest.run_id }}/alerts.csv">下载最近工单 CSV</a>{% endif %}
+          {% if latest and latest.publish_status == 'published' %}<a class="btn secondary small" href="/api/runs/{{ latest.run_id }}/alerts.csv">下载当前工单 CSV</a>{% endif %}
         </p>
         <ol class="list small" style="margin-bottom:0">
           <li>工作台选「内置样例」或上传自己的 CSV（列名必须与规则集一致）。</li>
@@ -169,7 +169,7 @@
           <thead><tr><th>模块</th><th>实现</th><th>页面落点</th></tr></thead>
           <tbody>
             <tr><td>1. 规则集</td><td><code>loader.py</code> + <code>sample_data/rules.json</code></td><td>侧栏锚点 1，工作台「列规则与权重」</td></tr>
-            <tr><td>2. 数据剖析</td><td><code>pipeline.py</code>（7 阶段纯函数）</td><td>侧栏锚点 2，工作台「剖析进度」</td></tr>
+            <tr><td>2. 数据剖析</td><td><code>job.py</code> 分片确认 + <code>pipeline.py</code>（7 阶段纯函数）</td><td>侧栏锚点 2，工作台「分片进度与发布状态」</td></tr>
             <tr><td>3. 重复检测</td><td><code>duplicates.py</code></td><td>侧栏锚点 3，工作台「重复检测」，结果页「缺失与重复」</td></tr>
             <tr><td>4. 异常检测</td><td><code>outliers.py</code>（IQR + 稳健 z）</td><td>侧栏锚点 4，工作台「异常检测」，结果页「异常值」</td></tr>
             <tr><td>5. 评分卡</td><td><code>score.py</code>（违规率 → 权重归一）</td><td>侧栏锚点 5，结果页「评分卡」分段</td></tr>
@@ -191,18 +191,22 @@
       </div>
       <div class="table-wrap roomy">
         <table class="dense">
-          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>行数</th><th>总分</th><th>分级</th><th>状态</th><th>工单</th></tr></thead>
+          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>源/健康/隔离</th><th>总分</th><th>分级</th><th>发布</th><th>工单</th></tr></thead>
           <tbody>
             {% for item in history %}
             <tr>
               <td><a href="/result/{{ item.run_id }}">{{ item.run_id }}</a></td>
               <td class="small muted nowrap">{{ item.created_at }}</td>
               <td class="small cell-ellipsis">{{ item.source }}</td>
-              <td>{{ item.rows or '—' }}</td>
+              <td class="small">{{ item.source_rows }} / {{ item.healthy_rows }} / {{ item.quarantine_rows }}</td>
               <td>{% if item.total_score is not none %}{{ item.total_score|num(2) }}{% else %}—{% endif %}</td>
               <td>{% if item.grade %}<span class="tag {% if item.grade == 'A' %}ok{% elif item.grade == 'B' %}warn{% else %}err{% endif %}">{{ item.grade }}</span>{% else %}—{% endif %}</td>
-              <td class="small">{{ item.stage }}</td>
-              <td class="small">{% if item.status == 'done' %}<a href="/api/runs/{{ item.run_id }}/alerts.csv">CSV</a>{% else %}—{% endif %}</td>
+              <td class="small">
+                {% if item.publish_status == 'published' %}<span class="tag ok">已发布</span>
+                {% elif item.status == 'failed' %}<span class="tag err">失败</span>
+                {% else %}<span class="tag warn">未发布</span>{% endif %}
+              </td>
+              <td class="small">{% if item.publish_status == 'published' %}<a href="/api/runs/{{ item.run_id }}/alerts.csv">CSV</a>{% else %}—{% endif %}</td>
             </tr>
             {% else %}
             <tr><td colspan="8" class="muted">还没有运行记录。点右上角「立即抽检样例」或去 <a href="/workbench">工作台</a> 执行一次。</td></tr>
@@ -211,7 +215,7 @@
         </table>
       </div>
       <div class="panel-actions">
-        <span class="small muted" style="align-self:center">缺列 / 空文件 / 只有表头都会返回 400 与中文原因，不会静默跳过。</span>
+        <span class="small muted" style="align-self:center">坏记录单独隔离并注明原因；只有全部分片核对相符并发布后，分数与工单才会更新，失败期间线上保留旧版。</span>
       </div>
     </section>
 

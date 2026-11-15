@@ -5,10 +5,10 @@
 权重{% if has_overrides %}已覆盖默认值（{{ override_count }} 项）{% else %}为默认值{% endif %} · 运行 {{ history|length }} 次{% endblock %}
 {% block actions %}
 <a class="btn secondary small" href="/workbench">回工作台</a>
-{% if recent %}<a class="btn small" href="/api/runs/{{ recent.run_id }}/alerts.csv">导出工单 CSV</a>{% endif %}
+{% if published %}<a class="btn small" href="/api/runs/{{ published.run_id }}/alerts.csv">导出当前工单 CSV</a>{% endif %}
 {% endblock %}
-{% block status_left %}权重只影响归一化分母，不改原始违规判定 · 覆盖写入 SQLite，刷新与重启都保留{% endblock %}
-{% block status_right %}{% if recent %}最近运行 <code>{{ recent.run_id }}</code> · 总分 {{ recent.total_score|num(2) }}（{{ recent.grade }}）{% else %}{{ app_name }}{% endif %}{% endblock %}
+{% block status_left %}权重只影响归一化分母，不改原始违规判定 · 覆盖写入 SQLite，刷新与重启都保留 · 工单仅对已发布版本开放{% endblock %}
+{% block status_right %}{% if published %}线上版本 <code>{{ published.run_id }}</code> · 总分 {{ published.total_score|num(2) }}（{{ published.grade }}）{% else %}{{ app_name }}{% endif %}{% endblock %}
 
 {% block content %}
 <div class="page-head">
@@ -31,32 +31,46 @@
         <span class="spacer"></span>
         <span class="small muted" id="review-stat">共 {{ history|length }} 次运行</span>
         <button type="button" class="btn small secondary" data-export-csv="history-table">导出运行清单</button>
-        {% if recent %}<a class="btn small secondary" href="/api/runs/{{ recent.run_id }}/alerts.csv">导出工单 CSV</a>{% endif %}
+        {% if published %}<a class="btn small secondary" href="/api/runs/{{ published.run_id }}/alerts.csv">导出当前工单 CSV</a>
+        <a class="btn small secondary" href="/api/runs/{{ published.run_id }}/quarantine.csv">导出隔离记录 CSV</a>{% endif %}
       </div>
       <div class="table-wrap roomy">
         <table class="dense" id="history-table">
-          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>行数</th><th>总分</th><th>分级</th><th>状态</th><th>工单</th></tr></thead>
+          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>源/健康/隔离</th><th>分片</th><th>总分</th><th>分级</th><th>状态</th><th>发布</th><th>工单/隔离</th></tr></thead>
           <tbody>
             {% for item in history %}
             <tr>
               <td><a href="/result/{{ item.run_id }}">{{ item.run_id }}</a></td>
               <td class="small muted nowrap">{{ item.created_at }}</td>
               <td class="small cell-ellipsis">{{ item.source }}</td>
-              <td>{{ item.rows or '—' }}</td>
+              <td class="small">{{ item.source_rows }} / {{ item.healthy_rows }} / {{ item.quarantine_rows }}</td>
+              <td class="small">{{ item.confirmed_shards }}/{{ item.shard_count or '—' }}</td>
               <td>{% if item.total_score is not none %}{{ item.total_score|num(2) }}{% else %}—{% endif %}</td>
               <td>{% if item.grade %}<span class="tag {% if item.grade == 'A' %}ok{% elif item.grade == 'B' %}warn{% else %}err{% endif %}">{{ item.grade }}</span>{% else %}—{% endif %}</td>
-              <td class="small">{{ item.stage }}</td>
-              <td class="small">{% if item.status == 'done' %}<a href="/api/runs/{{ item.run_id }}/alerts.csv">下载 CSV</a>{% else %}—{% endif %}</td>
+              <td class="small">
+                {% if item.status == 'failed' %}<span class="tag err">失败</span>
+                {% elif item.status == 'running' %}<span class="tag warn">运行中</span>
+                {% else %}<span class="tag ok">完成</span>{% endif %}
+                <span class="muted">{{ item.stage }}</span>
+              </td>
+              <td class="small">
+                {% if item.publish_status == 'published' %}<span class="tag ok">已发布</span>
+                {% else %}<span class="tag warn">未发布</span>{% endif %}
+              </td>
+              <td class="small nowrap">
+                {% if item.publish_status == 'published' %}<a href="/api/runs/{{ item.run_id }}/alerts.csv">工单</a>{% else %}—{% endif %}
+                {% if item.quarantine_rows %} · <a href="/api/runs/{{ item.run_id }}/quarantine.csv">隔离</a>{% endif %}
+              </td>
             </tr>
             {% else %}
-            <tr><td colspan="8" class="muted">暂无运行记录。去 <a href="/workbench">工作台</a> 执行一次抽检。</td></tr>
+            <tr><td colspan="10" class="muted">暂无运行记录。去 <a href="/workbench">工作台</a> 执行一次抽检。</td></tr>
             {% endfor %}
           </tbody>
         </table>
       </div>
       <div class="panel-actions">
         <span class="small muted" style="align-self:center">
-          历史按时间倒序；「工单」列的 CSV 使用该次运行自己的报告快照，重算后同一 run_id 的工单会跟着更新。
+          历史按时间倒序；只有发布状态为「已发布」的作业能导出工单，失败/待发布作业不会产生可下发工单，线上始终保留上一版。
         </span>
       </div>
     </section>
@@ -137,7 +151,7 @@
       <div class="panel-actions">
         <button type="submit" form="weight-form">保存权重</button>
         <button type="button" id="reset-weights" class="secondary" data-endpoint="/api/rules/weights/reset">恢复默认</button>
-        {% if recent %}<button type="button" id="rescore" class="secondary" data-run="{{ recent.run_id }}">按当前权重重算</button>{% endif %}
+        {% if published %}<button type="button" id="rescore" class="secondary" data-run="{{ published.run_id }}">按当前权重重算当前发布版</button>{% endif %}
       </div>
     </section>
   </div>

@@ -45,7 +45,11 @@ def load_rules(path: pathlib.Path | str | None = None) -> dict:
 
 
 def parse_csv_text(text: str) -> tuple[list[str], list[dict[str, str]]]:
-    """解析 CSV 文本 → (列名, 行字典列表)。空白行跳过，重复列名报错。"""
+    """解析 CSV 文本 → (列名, 行字典列表)。空白行跳过，重复列名报错。
+
+    兼容旧调用（规则模块单测等）；分片导入入口改用 parse_header +
+    quarantine.parse_records，坏记录会被隔离而不是静默跳过。
+    """
     if not text.strip():
         raise InputError("CSV 内容为空，请检查是否上传了空文件。")
     reader = csv.DictReader(io.StringIO(text))
@@ -72,6 +76,33 @@ def parse_csv_text(text: str) -> tuple[list[str], list[dict[str, str]]]:
     if len(rows) > settings.MAX_ROWS:
         raise InputError(f"数据超过 {settings.MAX_ROWS} 行上限，请分批抽检。")
     return columns, rows
+
+
+def parse_header(text: str) -> list[str]:
+    """只解析并校验表头（含列名重复检测），记录级校验交给 quarantine 模块。"""
+    if not text.strip():
+        raise InputError("CSV 内容为空，请检查是否上传了空文件。")
+    reader = csv.reader(io.StringIO(text))
+    try:
+        header = next(reader)
+    except (StopIteration, csv.Error) as exc:
+        raise InputError("CSV 缺少表头行。") from exc
+    columns = [(c or "").strip() for c in header]
+    if not columns or all(not c for c in columns):
+        raise InputError("CSV 缺少表头行。")
+    if len(set(columns)) != len(columns):
+        raise InputError("CSV 表头存在重复列名，请先去重。")
+    return columns
+
+
+def count_data_lines(text: str) -> int:
+    """统计表头之后的物理行数（含空白行/坏行），作为源记录数基准。"""
+    reader = csv.reader(io.StringIO(text))
+    try:
+        next(reader)
+    except StopIteration:
+        return 0
+    return sum(1 for _ in reader)
 
 
 def required_columns(rules: dict) -> list[str]:
@@ -108,6 +139,29 @@ def load_csv_text(text: str, rules: dict, source: str) -> dict:
     return {"columns": columns, "rows": rows, "source": source}
 
 
+def intake_text(text: str, rules: dict, source: str) -> dict:
+    """分片导入入口：表头走契约校验，记录逐条判定健康/隔离，不静默跳过任何一行。"""
+    columns = parse_header(text)
+    validate_columns(columns, rules)
+    tokens = missing_tokens(rules)
+    from . import quarantine
+
+    intake = quarantine.parse_records(text, columns, tokens)
+    if intake.source_count == 0:
+        raise InputError("CSV 只有表头、没有数据行。")
+    if intake.source_count > settings.MAX_ROWS:
+        raise InputError(f"数据超过 {settings.MAX_ROWS} 行上限，请分批抽检。")
+    return {
+        "columns": columns,
+        "rows": intake.healthy_rows,
+        "source": source,
+        "intake": intake,
+        "source_count": intake.source_count,
+        "healthy_count": intake.healthy_count,
+        "quarantine_count": intake.quarantine_count,
+    }
+
+
 def load_sample(rules: dict, path: pathlib.Path | str | None = None) -> dict:
     p = pathlib.Path(path) if path else settings.SAMPLE_CSV
     try:
@@ -118,6 +172,16 @@ def load_sample(rules: dict, path: pathlib.Path | str | None = None) -> dict:
     data = load_csv_text(text, rules, f"样例数据 {p.name}")
     data["encoding"] = encoding
     return data
+
+
+def sample_text(rules: dict | None = None, path: pathlib.Path | str | None = None) -> tuple[str, str]:
+    """读取样例 CSV 原文（分片入口需要原文做记录级隔离）。"""
+    p = pathlib.Path(path) if path else settings.SAMPLE_CSV
+    try:
+        raw = p.read_bytes()
+    except FileNotFoundError as exc:
+        raise InputError("样例数据缺失：sample_data/quality_sample.csv") from exc
+    return decode_bytes(raw)
 
 
 def to_float(value: str) -> float | None:

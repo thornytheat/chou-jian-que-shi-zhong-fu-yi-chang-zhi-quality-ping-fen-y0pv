@@ -702,3 +702,6 @@ ul.progress { height: auto; background: none; overflow: visible; }
 details summary { cursor: pointer; }
 
 td code { white-space: nowrap; }
+
+/* 分片作业页：失败原因等错误文本 */
+.err-text { color: var(--err); }

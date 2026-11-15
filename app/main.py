@@ -1,7 +1,8 @@
-"""FastAPI 路由（薄）：参数解析 + 调用剖析流水线 + 渲染页面。
+"""FastAPI 路由（薄）：参数解析 + 分片作业编排 + 渲染页面。
 
 核心计算都在 missing / duplicates / outliers / score / alerts / validators 里，
-路由只负责：取输入、起后台线程、读 SQLite 快照、套模板。
+路由只负责：取输入、起后台分片作业、读 SQLite 快照、套模板。
+分片状态机与发布核对在 job.py / store.py，本文件不直接写分片表。
 """
 from __future__ import annotations
 
@@ -16,7 +17,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import export, loader, pipeline, score, seed, settings, store
+from . import export, job, loader, pipeline, score, seed, settings, store
+from .quarantine import REASON_LABELS
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -35,6 +37,7 @@ app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 ALERT_PAGE_LIMIT = 80
+QUARANTINE_PAGE_LIMIT = 100
 _STATE: dict = {"rules": None, "seeded": False}
 _LOCK = threading.Lock()
 
@@ -73,16 +76,15 @@ def column_specs(r: dict) -> list[dict]:
     ]
 
 
-
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     ensure_seeded()
     r = rules()
     history = store.list_runs(limit=5)
-    latest = history[0] if history else None
-    latest_report = (store.get_run(latest["run_id"]) or {}).get("report") if latest else None
-    latest_report = latest_report or {}
-    # 首页统计：只读最近一次运行的报告快照，没有运行记录时全部为 None
+    published = store.get_published_run()
+    latest = published or (history[0] if history else None)
+    latest_report = (latest or {}).get("report") or {}
+    # 首页统计：读当前已发布版本；没有任何发布时全部为 None
     stats = {
         "runs": store.count_runs(),
         "total": latest.get("total_score") if latest else None,
@@ -112,6 +114,7 @@ def index(request: Request):
         "outlier": r.get("outlier"),
         "min_group_sample": r.get("min_group_sample"),
         "sample_rows": 2000,
+        "published": published,
     })
 
 
@@ -119,7 +122,9 @@ def index(request: Request):
 def workbench(request: Request):
     ensure_seeded()
     r = rules()
-    history = store.list_runs(limit=5)
+    history = store.list_runs(limit=8)
+    published = store.get_published_run()
+    published_report = (published or {}).get("report") or {}
     return templates.TemplateResponse(request, "workbench.html", {
         "app_name": settings.APP_NAME,
         "page": "workbench",
@@ -137,26 +142,46 @@ def workbench(request: Request):
         "history": history,
         "latest": history[0] if history else None,
         "stages": [label for _, label in pipeline.STAGES],
+        "published": published,
+        "published_report": published_report,
+        "reason_labels": REASON_LABELS,
+        "default_shard_size": settings.DEFAULT_SHARD_SIZE,
     })
 
 
+def _job_view_context(request: Request, run: dict) -> dict:
+    """运行中 / 失败 / 待发布作业的共用视图：分片进度 + 隔离记录 + 发布状态。"""
+    shards = store.list_shards(run["run_id"])
+    quarantine_items = store.list_quarantine(run["run_id"], limit=QUARANTINE_PAGE_LIMIT)
+    quarantine_total = store.count_quarantine(run["run_id"])
+    reason_summary = store.quarantine_reason_summary(run["run_id"])
+    published = store.get_published_run()
+    return {
+        "app_name": settings.APP_NAME,
+        "page": "result",
+        "run": run,
+        "shards": shards,
+        "quarantine_items": quarantine_items,
+        "quarantine_total": quarantine_total,
+        "quarantine_shown": min(QUARANTINE_PAGE_LIMIT, quarantine_total),
+        "reason_summary": reason_summary,
+        "reason_labels": REASON_LABELS,
+        "published": published,
+    }
+
+
 @app.get("/result/{run_id}", response_class=HTMLResponse)
-def result(request: Request, run_id: str, limit: int = ALERT_PAGE_LIMIT):
+def result(request: Request, run_id: str):
     ensure_seeded()
     run = store.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"运行记录 {run_id} 不存在，请回到工作台重新执行。")
-    if run["status"] == "running":
-        return templates.TemplateResponse(request, "running.html", {
-            "app_name": settings.APP_NAME,
-            "page": "result",
-            "run": run,
-        })
-    if run["status"] == "failed":
-        raise HTTPException(status_code=409, detail=f"该次运行失败：{run.get('error') or '未知错误'}")
+    if run["status"] != "done" or run["publish_status"] != "published":
+        # 运行中 / 失败 / 待发布：展示分片作业视图（含续跑入口），不暴露半成品结果
+        return templates.TemplateResponse(request, "job.html", _job_view_context(request, run))
     report = run["report"]
     total_alerts = report["alerts"]["total"]
-    limit = max(10, min(500, limit))
+    limit = max(10, min(500, ALERT_PAGE_LIMIT))
     return templates.TemplateResponse(request, "result.html", {
         "app_name": settings.APP_NAME,
         "page": "result",
@@ -171,6 +196,7 @@ def result(request: Request, run_id: str, limit: int = ALERT_PAGE_LIMIT):
         "insufficient": report["outliers"]["insufficient"],
         "rule_labels": score.RULE_LABELS,
         "severity_labels": {"high": "高", "medium": "中", "low": "低"},
+        "reason_labels": REASON_LABELS,
     })
 
 
@@ -181,13 +207,15 @@ def review(request: Request):
     overrides = store.weight_overrides()
     columns, rule_weights = score.merged_weights(r, overrides)
     history = store.list_runs(limit=20)
-    recent = history[0] if history else None
+    published = store.get_published_run()
+    recent = published or (history[0] if history else None)
     return templates.TemplateResponse(request, "review.html", {
         "app_name": settings.APP_NAME,
         "page": "review",
         "rules": r,
         "history": history,
         "recent": recent,
+        "published": published,
         "columns": [
             {"name": n, "label": s.get("label", n), "default": float(s.get("weight", 1.0)),
              "value": columns[n]}
@@ -204,78 +232,103 @@ def review(request: Request):
     })
 
 
-# ---------------------------------------------------------------- API
+# ---------------------------------------------------------------- 分片作业 API
 
 
-def _start_run(source: str, data: dict) -> dict:
+def _start_sharded_job(source: str, text: str, encoding: str, shard_size: int | None) -> dict:
     r = rules()
     overrides = store.weight_overrides()
+    try:
+        data = job.prepare_intake(text, r, source, shard_size or settings.DEFAULT_SHARD_SIZE)
+    except loader.InputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     run_id = uuid.uuid4().hex[:12]
-    store.create_run(run_id, source, overrides)
-    rows, columns = data["rows"], data["columns"]
+    data["encoding"] = encoding
+    payload = job.intake_payload(data, encoding)
+    store.create_run(run_id, source, overrides, intake=payload)
+    store.init_shards(run_id, data["shard_size"], job.shard_summaries(data["shards"]))
+    job.register_job_ctx(run_id, {"data": data, "rules": r, "weights": overrides})
+    # 必须在线程 start 前绑定测试/演示故障，保证故障注入无竞态
+    job.take_pending_faults(run_id)
 
-    def worker() -> None:
-        try:
-            def progress(index: int, label: str) -> None:
-                store.set_progress(run_id, index, label)
-
-            report = pipeline.run(rows, columns, r, overrides, progress)
-            report["run_id"] = run_id
-            report["dataset"]["source"] = source
-            report["dataset"]["encoding"] = data.get("encoding", "utf-8")
-            store.finish_run(run_id, report)
-        except Exception as exc:  # noqa: BLE001 - 记录失败原因给页面看
-            store.fail_run(run_id, f"{type(exc).__name__}: {exc}")
-
-    threading.Thread(target=worker, name=f"run-{run_id}", daemon=True).start()
-    return {"run_id": run_id, "status": "running", "stages": [s[1] for s in pipeline.STAGES]}
+    thread = threading.Thread(
+        target=job.run_job, args=(run_id, data, r, overrides),
+        name=f"shard-run-{run_id}", daemon=True,
+    )
+    thread.start()
+    return {
+        "run_id": run_id,
+        "status": "running",
+        "stages": [s[1] for s in pipeline.STAGES],
+        "shard_count": len(data["shards"]),
+        "shard_size": data["shard_size"],
+        "source_count": data["source_count"],
+        "healthy_count": data["healthy_count"],
+        "quarantine_count": data["quarantine_count"],
+    }
 
 
 @app.post("/api/runs")
-def create_run(payload: dict) -> dict:
+def create_run(payload: dict):
     ensure_seeded()
-    source = (payload or {}).get("source", "sample")
+    payload = payload or {}
+    source = payload.get("source", "sample")
     if source != "sample":
         raise HTTPException(status_code=400, detail="source 只支持 sample；上传请使用 /api/runs/upload。")
     r = rules()
     try:
-        data = loader.load_sample(r)
+        text, encoding = loader.sample_text(r)
     except loader.InputError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _start_run(data["source"], data)
+    return _start_sharded_job(f"样例数据 {settings.SAMPLE_CSV.name}", text, encoding,
+                              payload.get("shard_size"))
 
 
 @app.post("/api/runs/upload")
-async def create_run_upload(file: UploadFile = File(...)) -> dict:
+async def create_run_upload(file: UploadFile = File(...), shard_size: int | None = None):
     ensure_seeded()
     raw = await file.read()
     if not raw:
         raise HTTPException(status_code=400, detail="上传的文件为空，请选择含表头与数据行的 CSV。")
     if len(raw) > settings.MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=400, detail="文件超过 8MB 上限，请分批抽检。")
-    r = rules()
     try:
         text, encoding = loader.decode_bytes(raw)
-        data = loader.load_csv_text(text, r, f"上传文件 {file.filename or 'upload.csv'}")
     except loader.InputError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    data["encoding"] = encoding
-    return _start_run(data["source"], data)
+    return _start_sharded_job(f"上传文件 {file.filename or 'upload.csv'}", text, encoding, shard_size)
 
 
 @app.post("/api/runs/text")
-def create_run_text(payload: dict) -> dict:
-    """粘贴 CSV 文本执行（同样走严格表头校验）。"""
+def create_run_text(payload: dict):
+    """粘贴 CSV 文本执行（表头走严格契约校验，坏记录进隔离区而非报错）。"""
     ensure_seeded()
     text = (payload or {}).get("csv_text") or ""
     if not text.strip():
         raise HTTPException(status_code=400, detail="CSV 文本为空，请粘贴含表头的内容。")
-    r = rules()
-    try:
-        data = loader.load_csv_text(text, r, "粘贴的 CSV 文本")
-    except loader.InputError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _start_run(data["source"], data)
+    return _start_sharded_job("粘贴的 CSV 文本", text, "utf-8",
+                              (payload or {}).get("shard_size"))
+
+
+@app.post("/api/runs/{run_id}/resume")
+def resume_run(run_id: str):
+    run = store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"运行记录 {run_id} 不存在。")
+    if run["status"] != "failed":
+        raise HTTPException(status_code=409, detail="只有失败的作业可以续跑；该作业当前状态为 "
+                            f"{run['status']}。")
+    ctx = job.JOB_CTX.get(run_id)
+    if ctx is None:
+        raise HTTPException(
+            status_code=409,
+            detail="作业的内存上下文已随服务重启释放，已确认分片仍在库中；请重新上传 CSV 新建作业。",
+        )
+    started = job.resume_job(run_id, ctx["data"], ctx["rules"], ctx["weights"])
+    if not started:
+        raise HTTPException(status_code=409, detail="没有可续跑的失败分片。")
+    return {"run_id": run_id, "status": "running", "resumed": True}
 
 
 @app.get("/api/runs/{run_id}/status")
@@ -285,6 +338,11 @@ def run_status(run_id: str) -> dict:
         raise HTTPException(status_code=404, detail=f"运行记录 {run_id} 不存在。")
     stages = [{"name": name, "label": label} for name, label in pipeline.STAGES]
     report = run.get("report") or {}
+    shards = store.list_shards(run_id)
+    counters = {"confirmed": 0, "processing": 0, "pending": 0, "failed": 0}
+    for shard in shards:
+        counters[shard["status"]] = counters.get(shard["status"], 0) + 1
+    published = store.get_published_run()
     return {
         "run_id": run_id,
         "status": run["status"],
@@ -293,13 +351,62 @@ def run_status(run_id: str) -> dict:
         "stage_total": len(stages),
         "stages": stages,
         "rows": run["rows"],
+        "source_rows": run["source_rows"],
+        "healthy_rows": run["healthy_rows"],
+        "quarantine_rows": run["quarantine_rows"],
         "total_score": run["total_score"],
         "grade": run["grade"],
         "error": run.get("error"),
         "alerts": (report.get("alerts") or {}).get("total"),
         "elapsed_ms": report.get("elapsed_ms"),
         "result_url": f"/result/{run_id}",
+        "publish_status": run["publish_status"],
+        "published_at": run["published_at"],
+        "is_published_version": bool(published and published["run_id"] == run_id),
+        "published_run_id": published["run_id"] if published else None,
+        "shard_count": run["shard_count"],
+        "shard_size": run["shard_size"],
+        "confirmed_shards": run["confirmed_shards"],
+        "shard_counters": counters,
+        "shards": shards,
+        "resumable": run["status"] == "failed" and run_id in job.JOB_CTX,
     }
+
+
+@app.get("/api/runs/{run_id}/shards")
+def run_shards(run_id: str) -> dict:
+    if store.get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail=f"运行记录 {run_id} 不存在。")
+    return {"run_id": run_id, "shards": store.list_shards(run_id)}
+
+
+@app.get("/api/runs/{run_id}/quarantine")
+def run_quarantine(run_id: str, limit: int = 200, offset: int = 0) -> dict:
+    if store.get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail=f"运行记录 {run_id} 不存在。")
+    limit = max(1, min(1000, limit))
+    offset = max(0, offset)
+    return {
+        "run_id": run_id,
+        "total": store.count_quarantine(run_id),
+        "reason_summary": store.quarantine_reason_summary(run_id),
+        "reason_labels": REASON_LABELS,
+        "items": store.list_quarantine(run_id, limit=limit, offset=offset),
+    }
+
+
+@app.get("/api/runs/{run_id}/quarantine.csv", response_class=PlainTextResponse)
+def quarantine_csv(run_id: str):
+    run = store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"运行记录 {run_id} 不存在。")
+    items = store.list_quarantine(run_id, limit=settings.MAX_ROWS)
+    filename = f"qualiscan-quarantine-{run_id}.csv"
+    return PlainTextResponse(
+        export.quarantine_to_csv(items),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/runs/{run_id}/alerts.csv", response_class=PlainTextResponse)
@@ -307,8 +414,9 @@ def alerts_csv(run_id: str):
     run = store.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"运行记录 {run_id} 不存在。")
-    if run["status"] != "done" or not run.get("report"):
-        raise HTTPException(status_code=409, detail="该次运行尚未完成，暂不能导出工单。")
+    if run["publish_status"] != "published" or not run.get("report"):
+        raise HTTPException(status_code=409,
+                            detail="该次运行尚未发布，暂不能导出工单；失败期间请下载当前已发布旧版工单。")
     csv_text = export.alerts_to_csv(run["report"]["alerts"])
     filename = f"qualiscan-workorder-{run_id}.csv"
     return PlainTextResponse(
@@ -316,6 +424,28 @@ def alerts_csv(run_id: str):
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.get("/api/published")
+def published_api() -> dict:
+    run = store.get_published_run()
+    if run is None:
+        return {"published": False}
+    report = run.get("report") or {}
+    return {
+        "published": True,
+        "run_id": run["run_id"],
+        "published_at": run["published_at"],
+        "total_score": run["total_score"],
+        "grade": run["grade"],
+        "source_rows": run["source_rows"],
+        "healthy_rows": run["healthy_rows"],
+        "quarantine_rows": run["quarantine_rows"],
+        "alerts": (report.get("alerts") or {}).get("total"),
+        "workorder_url": f"/api/runs/{run['run_id']}/alerts.csv",
+        "quarantine_url": f"/api/runs/{run['run_id']}/quarantine.csv",
+        "result_url": f"/result/{run['run_id']}",
+    }
 
 
 @app.get("/api/rules/weights")
@@ -376,8 +506,8 @@ def rescore(run_id: str) -> dict:
     run = store.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"运行记录 {run_id} 不存在。")
-    if run["status"] != "done" or not run.get("report"):
-        raise HTTPException(status_code=409, detail="该次运行尚未完成，无法重算。")
+    if run["publish_status"] != "published" or not run.get("report"):
+        raise HTTPException(status_code=409, detail="该次运行尚未发布，无法重算。")
     r = rules()
     overrides = store.weight_overrides()
     report = run["report"]
@@ -396,12 +526,14 @@ def rescore(run_id: str) -> dict:
 @app.get("/health")
 def health() -> JSONResponse:
     ensure_seeded()
+    published = store.get_published_run()
     return JSONResponse({
         "status": "ok",
         "app": settings.APP_SHORT,
         "runs": store.count_runs(),
         "rules_version": rules().get("version"),
         "data_dir": str(settings.DATA_DIR),
+        "published_run_id": published["run_id"] if published else None,
     })
 
 

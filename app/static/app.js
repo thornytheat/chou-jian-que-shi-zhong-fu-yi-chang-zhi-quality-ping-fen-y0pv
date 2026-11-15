@@ -50,49 +50,94 @@
     if (box) { box.hidden = true; box.textContent = ''; }
   }
 
-  // ---------- 工作台：执行 + 进度 ----------
+  // ---------- 工作台：执行 + 分片进度 ----------
   var progressCard = qs('#progress-card');
   var bar = qs('#progress-bar');
   var text = qs('#progress-text');
-  var stageList = qs('#stage-list');
+  var shardSummary = qs('#shard-summary');
+  var shardTable = qs('#shard-list-table');
+  var shardBody = qs('#shard-list-body');
+  var resumeRow = qs('#resume-row');
+  var resumeBtn = qs('#resume-btn');
   var buttons = qsa('#run-sample, #run-text, #upload-form button[type="submit"], button[form="upload-form"]');
   var stateTag = qs('#progress-state');
+  var SHARD_STATUS_LABEL = { pending: '待处理', processing: '处理中', confirmed: '已确认', failed: '失败' };
+  var currentRunId = null;
 
   function setBusy(busy) {
     buttons.forEach(function (b) { b.disabled = busy; });
   }
 
-  function renderStages(index) {
-    if (!stageList) return;
-    qsa('li', stageList).forEach(function (li) {
-      var i = parseInt(li.getAttribute('data-stage'), 10);
-      li.className = i < index ? 'done' : (i === index ? 'active' : '');
-    });
+  function shardSizePayload() {
+    var input = qs('#shard-size-upload') || qs('#shard-size-text');
+    var value = input ? parseInt(input.value, 10) : NaN;
+    return isNaN(value) ? {} : { shard_size: value };
+  }
+
+  function renderShardTable(shards) {
+    if (!shardTable || !shardBody || !shards || !shards.length) return;
+    shardTable.hidden = false;
+    shardBody.innerHTML = shards.map(function (s) {
+      var cls = s.status === 'confirmed' ? 'ok' : (s.status === 'failed' ? 'err' : (s.status === 'processing' ? 'warn' : ''));
+      var note = s.status === 'failed' && s.last_error ? ' <span class="muted">' + s.last_error + '</span>' : '';
+      return '<tr><td>第 ' + (s.shard_index + 1) + ' 片</td>' +
+        '<td><span class="tag ' + cls + '">' + (SHARD_STATUS_LABEL[s.status] || s.status) + '</span>' + note + '</td>' +
+        '<td>' + s.total_records + '</td><td>' + s.healthy_records + '</td><td>' + s.quarantine_records +
+        '</td><td>' + s.attempts + '</td></tr>';
+    }).join('');
   }
 
   async function poll(runId) {
-    var total = 7;
-    for (var i = 0; i < 600; i++) {
+    currentRunId = runId;
+    for (var i = 0; i < 2000; i++) {
       var st = await fetch('/api/runs/' + runId + '/status').then(readJSON);
-      total = st.stage_total || total;
-      var done = st.status === 'done';
+      var total = st.shard_count || 0;
+      var done = st.status === 'done' && st.publish_status === 'published';
       var failed = st.status === 'failed';
       if (progressCard) progressCard.hidden = false;
-      if (bar) bar.style.width = (failed ? 100 : Math.min(100, Math.round(((st.stage_index + (done ? 1 : 0)) / total) * 100))) + '%';
+      if (bar && total) bar.style.width = (failed ? Math.round((st.confirmed_shards / total) * 100) : Math.round((st.confirmed_shards / total) * 100)) + '%';
+      if (shardSummary) {
+        shardSummary.textContent = '源记录 ' + st.source_rows + ' = 健康 ' + st.healthy_rows + ' + 隔离 ' +
+          st.quarantine_rows + ' · 分片 ' + st.confirmed_shards + '/' + total +
+          ' · 发布：' + (st.publish_status === 'published' ? '已发布' : '未发布（线上保留旧版）');
+      }
+      renderShardTable(st.shards);
       if (text) {
         text.textContent = failed
-          ? ('执行失败：' + (st.error || '未知错误'))
-          : (done ? ('完成：' + st.rows + ' 行，总分 ' + Number(st.total_score).toFixed(2) + '（' + st.grade + '），正在跳转结果页…')
-                  : ('当前阶段：' + st.stage + '（' + (st.stage_index + 1) + '/' + total + '）'));
+          ? ('作业失败：' + (st.error || '未知错误') + '（已确认 ' + st.confirmed_shards + '/' + total + ' 片，可续跑）')
+          : (done ? ('已发布：' + st.healthy_rows + ' 条健康记录评分 ' + Number(st.total_score).toFixed(2) + '（' + st.grade + '），正在跳转结果页…')
+                  : (st.stage + '（分片 ' + st.confirmed_shards + '/' + total + '）'));
       }
-      renderStages(done ? total : st.stage_index);
-      if (stateTag) stateTag.textContent = failed ? '失败' : (done ? '已完成' : '执行中 ' + (st.stage_index + 1) + '/' + total);
-      if (failed) { setBusy(false); showError(new Error(st.error || '计算失败')); return; }
+      if (stateTag) stateTag.textContent = failed ? '失败' : (done ? '已发布' : st.stage);
+      if (resumeRow) resumeRow.hidden = !(failed && st.resumable);
+      if (failed) {
+        setBusy(false);
+        showError(new Error(st.error || '分片处理失败'));
+        return;
+      }
       if (done) { window.location.href = st.result_url; return; }
-      await new Promise(function (r) { setTimeout(r, 300); });
+      await new Promise(function (r) { setTimeout(r, 400); });
     }
     setBusy(false);
-    showError(new Error('等待超时，请到「复核与工单」页查看运行记录'));
+    showError(new Error('等待超时，请到运行页查看分片状态'));
+  }
+
+  if (resumeBtn) {
+    resumeBtn.addEventListener('click', function () {
+      if (!currentRunId) return;
+      resumeBtn.disabled = true;
+      window.postJSON('/api/runs/' + currentRunId + '/resume', {})
+        .then(function () {
+          clearError();
+          if (resumeRow) resumeRow.hidden = true;
+          setBusy(true);
+          return poll(currentRunId);
+        })
+        .catch(function (err) {
+          resumeBtn.disabled = false;
+          showError(err);
+        });
+    });
   }
 
   function start(promise) {
@@ -100,19 +145,26 @@
     setBusy(true);
     if (progressCard) {
       progressCard.hidden = false;
-      if (bar) bar.style.width = '4%';
-      if (text) text.textContent = '已提交，正在载入数据…';
-      renderStages(0);
+      if (bar) bar.style.width = '2%';
+      if (text) text.textContent = '已提交，正在解析并隔离坏记录…';
+      if (shardTable) shardTable.hidden = true;
+      if (resumeRow) resumeRow.hidden = true;
       progressCard.scrollIntoView({ block: 'center' });
     }
-    promise.then(function (data) { return poll(data.run_id); })
-      .catch(function (err) { setBusy(false); showError(err); });
+    promise.then(function (data) {
+      if (shardSummary) {
+        shardSummary.textContent = '源记录 ' + data.source_count + ' = 健康 ' + data.healthy_count +
+          ' + 隔离 ' + data.quarantine_count + ' · 共 ' + data.shard_count + ' 片（每片 ≤ ' + data.shard_size + ' 条）';
+      }
+      return poll(data.run_id);
+    }).catch(function (err) { setBusy(false); showError(err); });
   }
 
   var sampleBtn = qs('#run-sample');
   if (sampleBtn) {
     sampleBtn.addEventListener('click', function () {
-      start(window.postJSON(sampleBtn.getAttribute('data-endpoint'), { source: 'sample' }));
+      start(window.postJSON(sampleBtn.getAttribute('data-endpoint'),
+        Object.assign({ source: 'sample' }, shardSizePayload())));
     });
   }
 
@@ -127,12 +179,14 @@
       }
       var form = new FormData();
       form.append('file', input.files[0]);
+      var size = shardSizePayload().shard_size;
+      if (size) form.append('shard_size', size);
       clearError();
       setBusy(true);
       if (progressCard) {
         progressCard.hidden = false;
-        if (bar) bar.style.width = '4%';
-        if (text) text.textContent = '正在上传并解析…';
+        if (bar) bar.style.width = '2%';
+        if (text) text.textContent = '正在上传、解析并隔离坏记录…';
       }
       start(fetch(uploadForm.getAttribute('data-endpoint'), { method: 'POST', body: form }).then(readJSON));
     });
@@ -144,7 +198,8 @@
       var area = qs('#csv-text');
       var content = area ? area.value : '';
       if (!content.trim()) { showError(new Error('请先粘贴含表头的 CSV 文本')); return; }
-      start(window.postJSON(textBtn.getAttribute('data-endpoint'), { csv_text: content }));
+      start(window.postJSON(textBtn.getAttribute('data-endpoint'),
+        Object.assign({ csv_text: content }, shardSizePayload())));
     });
   }
 
