@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}计算中 · {{ app_name }}{% endblock %}
+{% block crumb %}抽检结果（计算中）{% endblock %}
+{% block head %}<meta http-equiv="refresh" content="2">{% endblock %}
+{% block meta %}<span class="dot warn"></span>正在计算 {{ run.run_id }}{% endblock %}
+{% block status_left %}页面每 2 秒自动刷新；也可以回工作台重新发起一次抽检{% endblock %}
+{% block status_right %}run_id <code>{{ run.run_id }}</code>{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">正在计算 {{ run.run_id }}</h1>
+    <p class="page-sub">当前阶段：<strong>{{ run.stage }}</strong>（{{ run.stage_index }}/{{ stages_total if stages_total else 7 }}）· 完成后本页会自动跳到结果页。</p>
+  </div>
+  <div class="page-head-actions"><a class="btn secondary" href="/workbench">回工作台</a></div>
+</div>
+<div class="panel">
+  <div class="panel-head"><h2>剖析进度</h2><div class="panel-actions"><span class="tag">7 阶段</span></div></div>
+  <div class="panel-body">
+    <p class="small muted" style="margin:0">页面每 2 秒自动刷新；也可以回到 <a href="/workbench">工作台</a> 重新发起。</p>
+  </div>
+</div>
+{% endblock %}

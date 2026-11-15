@@ -1,0 +1,152 @@
+{
+  "version": "1.0",
+  "description": "上游商品数据抽检规则集：列级契约 + 缺失允许率 + 权重 + 异常检测参数 + 分级阈值",
+  "business_key": [
+    "product_id",
+    "category"
+  ],
+  "group_by": "category",
+  "min_group_sample": 8,
+  "missing_tokens": [
+    "",
+    "NA",
+    "N/A",
+    "NULL",
+    "null",
+    "-",
+    "—"
+  ],
+  "outlier": {
+    "iqr_k": 1.5,
+    "mad_k": 3.5,
+    "mad_scale": 1.4826,
+    "dual_hit_severity": "high",
+    "single_hit_severity": "medium"
+  },
+  "grade_thresholds": {
+    "A": 90,
+    "B": 80,
+    "C": 70
+  },
+  "rule_weights": {
+    "missing": 1.0,
+    "type": 0.6,
+    "range": 1.0,
+    "outlier": 1.2,
+    "duplicate_key": 0.8,
+    "duplicate_row": 1.0
+  },
+  "columns": {
+    "row_id": {
+      "label": "行号",
+      "type": "string",
+      "max_missing_rate": 0.0,
+      "weight": 0.3,
+      "rules": [
+        "missing"
+      ]
+    },
+    "product_id": {
+      "label": "商品ID",
+      "type": "string",
+      "max_missing_rate": 0.0,
+      "weight": 1.2,
+      "rules": [
+        "missing",
+        "duplicate_key"
+      ]
+    },
+    "category": {
+      "label": "品类",
+      "type": "string",
+      "max_missing_rate": 0.0,
+      "weight": 1.0,
+      "rules": [
+        "missing",
+        "duplicate_key"
+      ]
+    },
+    "price": {
+      "label": "售价（元）",
+      "type": "number",
+      "max_missing_rate": 0.02,
+      "weight": 1.5,
+      "range": {
+        "min": 0.5,
+        "max": 50000
+      },
+      "rules": [
+        "missing",
+        "type",
+        "range",
+        "outlier"
+      ]
+    },
+    "stock": {
+      "label": "库存（件）",
+      "type": "number",
+      "max_missing_rate": 0.02,
+      "weight": 1.0,
+      "range": {
+        "min": 0,
+        "max": 1000
+      },
+      "rules": [
+        "missing",
+        "type",
+        "range",
+        "outlier"
+      ]
+    },
+    "weight": {
+      "label": "重量（kg）",
+      "type": "number",
+      "max_missing_rate": 0.05,
+      "weight": 1.0,
+      "range": {
+        "min": 0.01,
+        "max": 50
+      },
+      "rules": [
+        "missing",
+        "type",
+        "range",
+        "outlier"
+      ]
+    },
+    "supplier": {
+      "label": "供应商",
+      "type": "string",
+      "max_missing_rate": 0.25,
+      "weight": 0.8,
+      "rules": [
+        "missing"
+      ]
+    },
+    "updated_at": {
+      "label": "更新时间",
+      "type": "date",
+      "max_missing_rate": 0.01,
+      "weight": 0.8,
+      "rules": [
+        "missing",
+        "type"
+      ]
+    },
+    "rating": {
+      "label": "评分",
+      "type": "number",
+      "max_missing_rate": 0.02,
+      "weight": 1.2,
+      "range": {
+        "min": 0,
+        "max": 5
+      },
+      "rules": [
+        "missing",
+        "range",
+        "outlier"
+      ]
+    }
+  }
+}

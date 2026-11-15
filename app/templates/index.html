@@ -1,0 +1,271 @@
+{% extends "base.html" %}
+{% block title %}总览 · {{ app_name }}{% endblock %}
+{% block crumb %}总览{% endblock %}
+{% block meta %}<span class="dot {% if stats and stats.alerts %}warn{% else %}ok{% endif %}"></span>服务正常 · 运行 {{ stats.runs if stats else history|length }} · 规则集 v{{ rules.version }}{% endblock %}
+{% block actions %}
+<a class="btn secondary small" href="/review">复核与工单</a>
+<button type="button" class="btn small" id="run-sample" data-endpoint="/api/runs">立即抽检样例</button>
+{% endblock %}
+{% block status_left %}样例 {{ sample_rows }} 行 × {{ columns|length }} 列 · 固定随机种子可复现 · 整改工单 CSV 可直发上游{% endblock %}
+{% block status_right %}{{ app_name }} · 规则集 v{{ rules.version }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">总览</h1>
+    <p class="page-sub">
+      数据质量组每月抽检上游商品主数据：缺失 / 重复 / 异常值 → 可复现百分制分数 + 整改工单。
+      一次抽检走 7 个固定阶段，同一份 CSV 与同一份 <code>rules.json</code> 得到完全相同的分数。
+    </p>
+  </div>
+  <div class="page-head-actions">
+    <a class="btn secondary" href="/workbench">打开抽检工作台</a>
+  </div>
+</div>
+
+<div class="alert alert-error" id="error-box" hidden role="alert"></div>
+
+<div class="kpi-strip">
+  <div class="kpi {% if latest and latest.grade in ['A','B'] %}ok{% elif latest and latest.grade %}warn{% endif %}">
+    <div class="k-label">最近总分（百分制）</div>
+    <div class="k-value">
+      {% if latest and latest.total_score is not none %}{{ latest.total_score|num(1) }}{% else %}—{% endif %}
+      {% if latest and latest.grade %}<span class="tag {% if latest.grade == 'A' %}ok{% elif latest.grade == 'B' %}warn{% else %}err{% endif %}">{{ latest.grade }}</span>{% endif %}
+    </div>
+    <div class="k-note">A≥{{ thresholds.A }} / B≥{{ thresholds.B }} / C≥{{ thresholds.C }}</div>
+  </div>
+  <div class="kpi {% if stats and stats.alerts %}warn{% endif %}">
+    <div class="k-label">告警（同格已合并）</div>
+    <div class="k-value">{{ stats.alerts if stats and stats.alerts is not none else '—' }}</div>
+    <div class="k-note">high {{ stats.high if stats else '—' }} · medium {{ stats.medium if stats else '—' }}</div>
+  </div>
+  <div class="kpi {% if stats and stats.duplicate_groups %}warn{% endif %}">
+    <div class="k-label">重复组</div>
+    <div class="k-value">{{ stats.duplicate_groups if stats and stats.duplicate_groups is not none else '—' }}</div>
+    <div class="k-note">复合键重复组 · 整行重复 {{ stats.row_groups if stats else '—' }} 组</div>
+  </div>
+  <div class="kpi">
+    <div class="k-label">运行数</div>
+    <div class="k-value">{{ stats.runs if stats else history|length }}</div>
+    <div class="k-note">SQLite 命名卷持久化</div>
+  </div>
+  <div class="kpi">
+    <div class="k-label">列 / 规则权重项</div>
+    <div class="k-value">{{ columns|length }} / {{ rule_weights|length }}</div>
+    <div class="k-note">{{ rules.group_by }} 分组 · 业务键 {{ business_key|join(' + ') }}</div>
+  </div>
+</div>
+
+<div class="split wide-left">
+  <div>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>快捷操作</h2>
+        <div class="panel-actions"><span class="tag">4 步主流程</span></div>
+      </div>
+      <div class="panel-body tight">
+        <p style="margin-top:2px">
+          <button type="button" class="btn small" id="run-sample-quick" data-run-proxy="run-sample">执行一次样例抽检</button>
+          <a class="btn secondary small" href="/workbench">到工作台选输入</a>
+        </p>
+        <p>
+          <a class="btn secondary small" href="/review">改权重并重算</a>
+          {% if latest and latest.status == 'done' %}<a class="btn secondary small" href="/api/runs/{{ latest.run_id }}/alerts.csv">下载最近工单 CSV</a>{% endif %}
+        </p>
+        <ol class="list small" style="margin-bottom:0">
+          <li>工作台选「内置样例」或上传自己的 CSV（列名必须与规则集一致）。</li>
+          <li>点「执行剖析」：7 个阶段实时推进，完成自动跳结果页。</li>
+          <li>结果页看总分与分级、每列违规率、分级依据与告警工单。</li>
+          <li>复核页改权重 → 用新权重重算 → 下载整改工单 CSV 下发上游。</li>
+        </ol>
+      </div>
+      <div class="panel-actions">
+        <a class="btn small" href="/workbench">打开抽检工作台</a>
+        <a class="btn secondary small" href="/review">复核与工单</a>
+      </div>
+    </section>
+
+    <details class="help" style="margin-top:12px">
+      <summary>业务背景、演示步骤与样例说明（点开看全部口径）</summary>
+
+      <p class="small" style="margin-top:6px">
+        <strong>谁在用</strong>：数据质量组（每月抽检一次上游商品主数据）。
+        <strong>痛点</strong>：① 分数靠人工拍脑袋，无法复现；② 同一行的多个问题被拆成多张工单，下游反复返工；
+        ③ 小品类被大品类规则误判成异常，整改要求站不住脚。
+      </p>
+      <p class="small">
+        <strong>系统替代哪一段</strong>：把抽检 CSV 交给规则集，自动算缺失率、业务键/整行重复、按品类分组的双法异常值，
+        给出百分制分数与 A/B/C/D 分级，并把同一单元格的多条命中合并成一张整改工单，CSV 下发。
+      </p>
+
+      <h3>演示步骤（每步都真实可点）</h3>
+      <ol class="list small">
+        <li>打开 <a href="/workbench">抽检工作台</a>：直接选「内置样例 quality_sample.csv」或上传自己的 CSV（9 列 2000 行）。</li>
+        <li>点「执行剖析」：页面按 7 个阶段显示进度（载入 → 缺失 → 重复 → 异常 → 校验 → 评分 → 告警），完成后自动跳到结果页。</li>
+        <li>结果页看：总分与分级、每列违规率表、high/medium 告警（同一单元格只出现一条，<code>rules[]</code> 保留全部命中规则）、样本不足品类说明。</li>
+        <li>去 <a href="/review">复核与工单</a>：改权重 → 用新权重重算 → 体会分数变化；下载工单 CSV（row_id / column / rules / severity / 建议）。</li>
+        <li>故意制造错误：上传一份缺列 CSV（例如删掉 price 列），接口返回 400 与中文原因，页面可恢复重试。</li>
+      </ol>
+
+      <h3>样例数据埋了什么</h3>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead><tr><th>类别</th><th>埋点</th><th>预期判定</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>缺失（3 类）</td>
+              <td class="small"><code>supplier</code> 缺失约 18%（允许 25%）；<code>weight</code> 缺失约 14%（允许 5%）；<code>rating</code> 整列全空</td>
+              <td class="small"><span class="tag ok">allowed</span> 不扣分 · <span class="tag warn">violation</span> 扣分 · <span class="tag err">all_empty</span> 该列缺失规则 0 分</td>
+            </tr>
+            <tr>
+              <td>重复（2 类）</td>
+              <td class="small">复合业务键重复 <code>P00009 + 数码配件</code> 出现 3 行；整行重复 <code>R000020 / R000021</code> 除 row_id 外完全一致</td>
+              <td class="small">整行重复整体归入 <code>duplicate_row</code>，不再重复计入 <code>duplicate_key</code>（避免同一批行双重扣分）</td>
+            </tr>
+            <tr>
+              <td>异常值 / 边界</td>
+              <td class="small">按 5 个品类分组，IQR 与稳健 z 双法同判；<code>价格 99999</code> 与 <code>价格 0.01</code>；<code>食品饮料</code> 重量恒为 0.5kg；小品类「小众配件」仅 5 行</td>
+              <td class="small">双法命中 <span class="tag err">high</span> · 仅 IQR 命中 <span class="tag warn">medium</span> · MAD=0 时稳健 z 不可判（不误报）· 组内样本 &lt; {{ min_group_sample }} 判 <code>insufficient_sample</code> 不判异常</td>
+            </tr>
+            <tr>
+              <td>类型 / 范围</td>
+              <td class="small">越界：库存 -5、重量 0；类型错：价格「面议」、日期 2026-13-45</td>
+              <td class="small">写入「类型合法」「取值范围」两条规则的违规数，进结果页评分卡与整改工单</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>规则集概览（sample_data/rules.json · v{{ rules.version }}）</h3>
+      <p class="small muted">
+        业务键 = <code>{{ business_key|join(' + ') }}</code>；异常值分组列 = <code>{{ rules.group_by }}</code>；
+        组内最小样本 = {{ min_group_sample }}；
+        规则权重：{% for k, v in rule_weights.items() %}{{ rule_labels.get(k, k) }} {{ v }}{% if not loop.last %} · {% endif %}{% endfor %}
+      </p>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead>
+            <tr><th>列</th><th>含义</th><th>类型</th><th>允许缺失率</th><th>取值范围</th><th>启用规则</th><th>列权重</th></tr>
+          </thead>
+          <tbody>
+            {% for col in columns %}
+            <tr>
+              <td><code>{{ col.name }}</code></td>
+              <td>{{ col.label }}</td>
+              <td><span class="tag">{{ col.type }}</span></td>
+              <td>{{ col.max_missing_rate|pct(1) }}</td>
+              <td class="small">{% if col.range %}[{{ col.range.min }}, {{ col.range.max }}]{% else %}—{% endif %}</td>
+              <td class="small">{{ col.rules|join('、') }}</td>
+              <td>{{ col.weight }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <h3>6 个业务模块与页面落点</h3>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead><tr><th>模块</th><th>实现</th><th>页面落点</th></tr></thead>
+          <tbody>
+            <tr><td>1. 规则集</td><td><code>loader.py</code> + <code>sample_data/rules.json</code></td><td>侧栏锚点 1，工作台「列规则与权重」</td></tr>
+            <tr><td>2. 数据剖析</td><td><code>pipeline.py</code>（7 阶段纯函数）</td><td>侧栏锚点 2，工作台「剖析进度」</td></tr>
+            <tr><td>3. 重复检测</td><td><code>duplicates.py</code></td><td>侧栏锚点 3，工作台「重复检测」，结果页「缺失与重复」</td></tr>
+            <tr><td>4. 异常检测</td><td><code>outliers.py</code>（IQR + 稳健 z）</td><td>侧栏锚点 4，工作台「异常检测」，结果页「异常值」</td></tr>
+            <tr><td>5. 评分卡</td><td><code>score.py</code>（违规率 → 权重归一）</td><td>侧栏锚点 5，结果页「评分卡」分段</td></tr>
+            <tr><td>6. 工单导出</td><td><code>alerts.py</code> + <code>export.py</code></td><td>侧栏锚点 6，结果页「告警」分段与复核页导出</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </details>
+  </div>
+
+  <div>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>最近抽检</h2>
+        <div class="panel-actions">
+          <span class="tag">{{ stats.runs if stats else history|length }} 次运行</span>
+          <a class="btn secondary small" href="/review">全部记录</a>
+        </div>
+      </div>
+      <div class="table-wrap roomy">
+        <table class="dense">
+          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>行数</th><th>总分</th><th>分级</th><th>状态</th><th>工单</th></tr></thead>
+          <tbody>
+            {% for item in history %}
+            <tr>
+              <td><a href="/result/{{ item.run_id }}">{{ item.run_id }}</a></td>
+              <td class="small muted nowrap">{{ item.created_at }}</td>
+              <td class="small cell-ellipsis">{{ item.source }}</td>
+              <td>{{ item.rows or '—' }}</td>
+              <td>{% if item.total_score is not none %}{{ item.total_score|num(2) }}{% else %}—{% endif %}</td>
+              <td>{% if item.grade %}<span class="tag {% if item.grade == 'A' %}ok{% elif item.grade == 'B' %}warn{% else %}err{% endif %}">{{ item.grade }}</span>{% else %}—{% endif %}</td>
+              <td class="small">{{ item.stage }}</td>
+              <td class="small">{% if item.status == 'done' %}<a href="/api/runs/{{ item.run_id }}/alerts.csv">CSV</a>{% else %}—{% endif %}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="8" class="muted">还没有运行记录。点右上角「立即抽检样例」或去 <a href="/workbench">工作台</a> 执行一次。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-actions">
+        <span class="small muted" style="align-self:center">缺列 / 空文件 / 只有表头都会返回 400 与中文原因，不会静默跳过。</span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>评分口径与阈值</h2>
+        <div class="panel-actions"><span class="tag">可复现</span></div>
+      </div>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead><tr><th>口径</th><th>取值</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>评分</td>
+              <td>百分制</td>
+              <td class="small">每列每规则 score = 1 − 违规率，按「列权重 × 规则权重」归一；
+                分级 A≥{{ thresholds.A }} / B≥{{ thresholds.B }} / C≥{{ thresholds.C }} / D&lt;{{ thresholds.C }}</td>
+            </tr>
+            <tr>
+              <td>异常值双法</td>
+              <td>IQR + 稳健z</td>
+              <td class="small">IQR {{ outlier.iqr_k }}×IQR；|x−median|/(1.4826·MAD) &gt; {{ outlier.mad_k }}；
+                双法命中 high，单法 medium，组内样本 &lt; {{ min_group_sample }} 不判（样本不足）</td>
+            </tr>
+            <tr>
+              <td>业务键</td>
+              <td><code>{{ business_key|join(' + ') }}</code></td>
+              <td class="small">同键多行 → 复合键重复组；整行重复单独计，不再重复计入键重复</td>
+            </tr>
+            <tr>
+              <td>分组</td>
+              <td><code>{{ rules.group_by }}</code></td>
+              <td class="small">异常值按品类分组各自算分位数，小品类不会被大品类规则误判</td>
+            </tr>
+            <tr>
+              <td>工单</td>
+              <td>同一 (row_id, column)</td>
+              <td class="small">只出一条告警，<code>rules[]</code> 保留全部命中规则；缺失违规按「前 20 行逐行 + 其余按列汇总」输出</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</div>
+
+{% endblock %}
+{% block scripts %}
+<script>
+  // 首页快捷执行：代理滚动到主按钮（同一套 app.js 逻辑，避免重复绑定）
+  (function () {
+    var quick = document.getElementById('run-sample-quick');
+    var main = document.getElementById('run-sample');
+    if (quick && main) quick.addEventListener('click', function () { main.click(); });
+  })();
+</script>
+{% endblock %}

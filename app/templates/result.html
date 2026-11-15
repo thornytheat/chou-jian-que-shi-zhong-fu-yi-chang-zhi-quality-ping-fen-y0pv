@@ -1,0 +1,296 @@
+{% extends "base.html" %}
+{% block title %}抽检结果 {{ run.run_id }} · {{ app_name }}{% endblock %}
+{% block crumb %}抽检结果{% endblock %}
+{% block meta %}<span class="dot {% if score.total >= score.thresholds.B %}ok{% else %}warn{% endif %}"></span>
+总分 {{ score.total|num(2) }} · 分级 {{ score.grade }} · {{ report.dataset.rows }} 行{% endblock %}
+{% block actions %}
+<a class="btn secondary small" href="/workbench">再抽检一次</a>
+<a class="btn secondary small" href="/review">去复核页改权重</a>
+<a class="btn small" href="/api/runs/{{ run.run_id }}/alerts.csv">下载工单 CSV</a>
+{% endblock %}
+{% block status_left %}规则集 v{{ report.dataset.rule_version }} · 业务键 {{ report.dataset.business_key|join(' + ') }} · 耗时 {{ report.elapsed_ms|num(1) }} ms · 同一输入可复现{% endblock %}
+{% block status_right %}run_id <code>{{ run.run_id }}</code>{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">抽检结果 · {{ run.run_id }}</h1>
+    <p class="page-sub">
+      数据源 {{ report.dataset.source }} · 编码 {{ report.dataset.encoding }} ·
+      {{ report.dataset.rows }} 行 × {{ report.dataset.columns }} 列 · 规则集 v{{ report.dataset.rule_version }} ·
+      业务键 {{ report.dataset.business_key|join(' + ') }} · 执行于 {{ run.created_at }} · 耗时 {{ report.elapsed_ms|num(1) }} ms
+      <br>
+      加权总分 <strong>{{ score.total|num(2) }}</strong>（分级
+      <span class="tag {% if score.grade == 'A' %}ok{% elif score.grade == 'B' %}warn{% else %}err{% endif %}">{{ score.grade }}</span>，
+      阈 A≥{{ score.thresholds.A }} / B≥{{ score.thresholds.B }} / C≥{{ score.thresholds.C }}）；
+      共 {{ alerts_total }} 条告警，同一 <code>(row_id, column)</code> 只保留一条并合并全部命中规则。
+    </p>
+  </div>
+</div>
+
+<div class="kpi-strip">
+  <div class="kpi {% if score.grade in ['A','B'] %}ok{% else %}err{% endif %}">
+    <div class="k-label">加权总分（百分制）</div>
+    <div class="k-value">{{ score.total|num(2) }}</div>
+    <div class="k-note">分级 {{ score.grade }} · 权重合计 {{ score.weight_sum|num(2) }}</div>
+  </div>
+  <div class="kpi {% if report.alerts.high %}err{% elif report.alerts.total %}warn{% endif %}">
+    <div class="k-label">告警（同格已合并）</div>
+    <div class="k-value">{{ alerts_total }}</div>
+    <div class="k-note">high {{ report.alerts.high }} · medium {{ report.alerts.medium }}</div>
+  </div>
+  <div class="kpi {% if report.duplicates.duplicate_key.group_count %}warn{% endif %}">
+    <div class="k-label">重复组</div>
+    <div class="k-value">{{ report.duplicates.duplicate_key.group_count }}</div>
+    <div class="k-note">复合键重复组 · 整行重复 {{ report.duplicates.duplicate_row.group_count }} 组 · 额外行 {{ report.duplicates.total_extra_rows }}</div>
+  </div>
+  <div class="kpi {% if report.outliers.high %}err{% elif report.outliers.cells %}warn{% endif %}">
+    <div class="k-label">异常单元格</div>
+    <div class="k-value">{{ report.outliers.cells|length }}</div>
+    <div class="k-note">双法 high {{ report.outliers.high }} · 单法 medium {{ report.outliers.medium }}</div>
+  </div>
+  <div class="kpi {% if insufficient %}warn{% endif %}">
+    <div class="k-label">样本不足</div>
+    <div class="k-value">{{ insufficient|length }}</div>
+    <div class="k-note">列 × 分组 · 组内样本 &lt; {{ report.outliers.min_sample }} 不判异常</div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-head">
+    <div class="segmented">
+      <button type="button" data-tab-target="tab-score" class="active">评分卡</button>
+      <button type="button" data-tab-target="tab-missing">缺失与重复</button>
+      <button type="button" data-tab-target="tab-outliers">异常值</button>
+      <button type="button" data-tab-target="tab-alerts">告警</button>
+    </div>
+    <div class="panel-actions">
+      <span class="tag">{{ alerts_total }} 条告警</span>
+      <a class="btn secondary small" href="/api/runs/{{ run.run_id }}/alerts.csv">下载工单 CSV</a>
+    </div>
+  </div>
+
+  {# ---------------- 评分卡 ---------------- #}
+  <div id="tab-score" class="tab-panel">
+    <div class="panel-body tight">
+      <h3 style="margin:0 0 4px">每列每规则违规率与得分</h3>
+      <p class="small muted" style="margin:0 0 8px">
+        score = 1 − 违规率（裁剪到 [0,1]），再按「列权重 × 规则权重」归一成百分制总分。无样本的规则按满分计入并标注。
+      </p>
+    </div>
+    <div class="table-wrap roomy">
+      <table class="dense">
+        <thead><tr><th>列</th><th>规则</th><th>有效样本</th><th>违规数</th><th>违规率</th><th>得分</th><th>权重</th><th>口径说明</th></tr></thead>
+        <tbody>
+          {% for item in score["items"] %}
+          <tr>
+            <td><code>{{ item.column_label }}</code></td>
+            <td>{{ item.rule_label }}</td>
+            <td>{{ item.samples }}</td>
+            <td>{{ item.violations }}</td>
+            <td>{% if item.samples %}{{ item.rate|pct(2) }}{% else %}—{% endif %}</td>
+            <td>
+              <span class="tag {% if item.score_pct >= 99.5 %}ok{% elif item.score_pct >= 90 %}warn{% else %}err{% endif %}">{{ item.score_pct|num(2) }}</span>
+            </td>
+            <td class="small">{{ item.weight|num(2) }}</td>
+            <td class="small muted cell-ellipsis">{{ item.note or '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="panel-body tight">
+      {% if score.notes %}
+      <details class="help">
+        <summary>无样本按满分的规则（{{ score.notes|length }} 条）</summary>
+        <ul class="list small muted" style="margin:6px 0 0">{% for n in score.notes %}<li>{{ n }}</li>{% endfor %}</ul>
+      </details>
+      {% endif %}
+      <details class="help" style="margin-top:8px">
+        <summary>计算过程与本次使用的权重（可复现）</summary>
+        <p class="small muted" style="margin:6px 0">固定顺序执行，每步都是纯函数；同一份 CSV + 同一份 rules.json 得到完全相同的分数。</p>
+        <div class="table-wrap auto">
+          <table class="dense">
+            <thead><tr><th>#</th><th>阶段</th><th>累计耗时 (ms)</th></tr></thead>
+            <tbody>
+              {% for s in report.stages %}
+              <tr><td>{{ loop.index }}</td><td>{{ s.label }}</td><td>{{ s.ms|num(2) }}</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <p class="small muted" style="margin:8px 0 0">
+          列权重 {% for k, v in score.weights_used.columns.items() %}{{ k }}={{ v }}{% if not loop.last %} · {% endif %}{% endfor %}；
+          规则权重 {% for k, v in score.weights_used.rule_weights.items() %}{{ k }}={{ v }}{% if not loop.last %} · {% endif %}{% endfor %}
+        </p>
+      </details>
+    </div>
+  </div>
+
+  {# ---------------- 缺失与重复 ---------------- #}
+  <div id="tab-missing" class="tab-panel" hidden>
+    <div class="panel-body tight">
+      <h3 style="margin:0 0 4px">缺失明细（按列）</h3>
+      <p class="small muted" style="margin:0 0 8px">
+        允许缺失率来自规则集；缺失率恰好等于允许值判 allowed，严 0.49 个百分点即判 violation；整列全空记 all_empty 且该列缺失规则 0 分。
+      </p>
+    </div>
+    <div class="table-wrap roomy">
+      <table class="dense">
+        <thead><tr><th>列</th><th>缺失行数</th><th>缺失率</th><th>允许缺失率</th><th>判定</th><th>说明</th><th>示例行号</th></tr></thead>
+        <tbody>
+          {% for item in report.missing.columns %}
+          <tr>
+            <td><code>{{ item.column }}</code></td>
+            <td>{{ item.missing }}</td>
+            <td>{{ item.rate|pct(2) }}</td>
+            <td>{{ item.max_rate|pct(2) }}</td>
+            <td>
+              {% if item.status == 'allowed' %}<span class="tag ok">allowed</span>
+              {% elif item.status == 'all_empty' %}<span class="tag err">all_empty</span>
+              {% else %}<span class="tag warn">violation</span>{% endif %}
+            </td>
+            <td class="small">{{ item.note }}</td>
+            <td class="small muted">{% if item.sample_row_ids %}{{ item.sample_row_ids[:5]|join('、') }}{% if item.missing > 5 %} …{% endif %}{% else %}—{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panel-body tight">
+      <h3 style="margin:0 0 4px">复合业务键重复 · <code>{{ report.duplicates.business_key|join(' + ') }}</code></h3>
+      <p class="small muted" style="margin:0 0 8px">
+        整行重复的 {{ report.duplicates.excluded_from_key }} 行已整体归入下面的 duplicate_row，不再重复计入本项。
+      </p>
+    </div>
+    {% if report.duplicates.duplicate_key.groups %}
+    <div class="table-wrap">
+      <table class="dense">
+        <thead><tr><th>业务键</th><th>行数</th><th>额外行</th><th>涉及行号</th></tr></thead>
+        <tbody>
+          {% for g in report.duplicates.duplicate_key.groups %}
+          <tr>
+            <td class="small">{{ g.label }}</td>
+            <td>{{ g.count }}</td>
+            <td>{{ g.extra }}</td>
+            <td class="small">{{ g.row_ids|join('、') }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">未发现复合业务键重复。</div>{% endif %}
+
+    <div class="panel-body tight">
+      <h3 style="margin:0 0 4px">整行重复 · 除 row_id 外全部列一致</h3>
+    </div>
+    {% if report.duplicates.duplicate_row.groups %}
+    <div class="table-wrap">
+      <table class="dense">
+        <thead><tr><th>重复组</th><th>行数</th><th>额外行</th><th>涉及行号</th></tr></thead>
+        <tbody>
+          {% for g in report.duplicates.duplicate_row.groups %}
+          <tr>
+            <td class="small">{{ g.label }}</td>
+            <td>{{ g.count }}</td>
+            <td>{{ g.extra }}</td>
+            <td class="small">{{ g.row_ids|join('、') }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">未发现整行重复。</div>{% endif %}
+  </div>
+
+  {# ---------------- 异常值 ---------------- #}
+  <div id="tab-outliers" class="tab-panel" hidden>
+    <div class="panel-body tight">
+      <h3 style="margin:0 0 4px">异常值分组统计（按 {{ report.outliers.group_by }} 分组，IQR 与稳健 z 双法）</h3>
+      <p class="small muted" style="margin:0 0 8px">
+        IQR 系数 {{ report.outliers.params.iqr_k }} · 稳健 z 阈值 {{ report.outliers.params.mad_k }} ·
+        MAD 缩放 1.4826 · 组内样本 &lt; {{ report.outliers.min_sample }} 不判异常（insufficient_sample）
+      </p>
+    </div>
+    <div class="table-wrap roomy">
+      <table class="dense">
+        <thead><tr><th>列</th><th>分组</th><th>样本</th><th>中位数</th><th>MAD</th><th>Q1</th><th>Q3</th><th>IQR 下界</th><th>IQR 上界</th><th>命中</th><th>状态</th></tr></thead>
+        <tbody>
+          {% for column, col in report.outliers.columns.items() %}
+            {% for g in col.groups %}
+            <tr>
+              <td><code>{{ column }}</code></td>
+              <td>{{ g.group }}</td>
+              <td>{{ g.sample }}</td>
+              <td>{% if g.status == 'evaluated' %}{{ g.median|num(2) }}{% else %}—{% endif %}</td>
+              <td>{% if g.status == 'evaluated' %}{{ g.mad|num(2) }}{% if g.mad_zero %} <span class="tag warn">MAD=0</span>{% endif %}{% else %}—{% endif %}</td>
+              <td>{% if g.status == 'evaluated' %}{{ g.q1|num(2) }}{% else %}—{% endif %}</td>
+              <td>{% if g.status == 'evaluated' %}{{ g.q3|num(2) }}{% else %}—{% endif %}</td>
+              <td>{% if g.status == 'evaluated' %}{{ g.low|num(2) }}{% else %}—{% endif %}</td>
+              <td>{% if g.status == 'evaluated' %}{{ g.high|num(2) }}{% else %}—{% endif %}</td>
+              <td>{% if g.status == 'evaluated' %}{{ g.outlier_count }}{% else %}—{% endif %}</td>
+              <td class="small">
+                {% if g.status == 'evaluated' %}<span class="tag ok">已判定</span>
+                {% else %}<span class="tag warn">样本不足</span>{% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if insufficient %}
+    <div class="panel-body tight">
+      <h3 style="margin:0 0 4px">样本不足、不判异常的「列 × 分组」</h3>
+      <ul class="list small" style="margin:6px 0 0">
+        {% for item in insufficient %}
+        <li><code>{{ item.column }}</code> · {{ item.group }}：有效样本 {{ item.sample }} &lt; {{ item.min_sample }}，{{ item.note or '不判异常' }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+    <div class="panel-actions">
+      <span class="small muted" style="align-self:center">双法同时命中判 high，仅一法命中判 medium；MAD=0 的组跳过稳健 z，避免误报。</span>
+    </div>
+  </div>
+
+  {# ---------------- 告警 ---------------- #}
+  <div id="tab-alerts" class="tab-panel" hidden>
+    <div class="panel-body tight">
+      <h3 style="margin:0 0 4px">告警与整改（同一 (row_id, column) 只出现一条，rules[] 为全部命中规则）</h3>
+      <p class="small muted" style="margin:0 0 8px">
+        共 {{ alerts_total }} 条，当前页面渲染前 {{ alerts_shown }} 条（按 severity 排序，表头在容器内吸顶）。
+        <a href="/api/runs/{{ run.run_id }}/alerts.csv">下载完整工单 CSV</a>（含全部 {{ alerts_total }} 条，可直接下发上游）。
+      </p>
+    </div>
+    <div class="table-wrap roomy">
+      <table class="dense">
+        <thead><tr><th>row_id</th><th>列</th><th>命中规则</th><th>严重度</th><th>当前值</th><th>依据</th><th>整改建议</th></tr></thead>
+        <tbody>
+          {% for a in alerts %}
+          <tr>
+            <td><code>{{ a.row_id }}</code></td>
+            <td><code>{{ a.column }}</code></td>
+            <td class="small">
+              {% for r in a.rules %}<span class="tag">{{ r }}</span>{% endfor %}
+              {% if a.merged_from > 1 %}<span class="tag warn">合并 {{ a.merged_from }} 条</span>{% endif %}
+            </td>
+            <td><span class="tag {{ a.severity|sev }}">{{ a.severity_label }}</span></td>
+            <td class="small">{{ a.value }}</td>
+            <td class="small muted">{{ a.reason }}</td>
+            <td class="small">{{ a.suggestion }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="panel-actions">
+      <span class="small muted" style="align-self:center">
+        缺失违规按「前 20 行逐行 + 其余按列汇总」输出，避免同一列的数百行缺失把工单撑爆；列级汇总在缺失明细表中是完整计数。
+      </span>
+      <a class="btn secondary small" href="/api/runs/{{ run.run_id }}/alerts.csv">下载完整工单 CSV</a>
+    </div>
+  </div>
+</div>
+{% endblock %}

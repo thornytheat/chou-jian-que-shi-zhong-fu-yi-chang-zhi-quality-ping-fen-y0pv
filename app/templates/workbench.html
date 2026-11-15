@@ -1,0 +1,276 @@
+{% extends "base.html" %}
+{% block title %}抽检工作台 · {{ app_name }}{% endblock %}
+{% block crumb %}抽检工作台{% endblock %}
+{% block meta %}<span class="dot ok"></span>规则集 v{{ rules_version }} · {{ column_specs|length }} 列 · {{ stages|length }} 阶段{% endblock %}
+{% block actions %}
+<a class="btn secondary small" href="/review">改权重</a>
+<button type="submit" form="upload-form" class="btn small">上传并执行</button>
+{% endblock %}
+{% block status_left %}剖析只读输入与规则集，不做任何写回 · 缺列/空文件返回 400 与中文原因{% endblock %}
+{% block status_right %}规则集 v{{ rules_version }} · 业务键 {{ business_key|join(' + ') }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">抽检工作台</h1>
+    <p class="page-sub">
+      两种输入任选其一：内置样例（{{ sample_rows }} 行 × {{ column_specs|length }} 列）或上传自己的 CSV（列名必须与规则集一致）。
+      执行后按 {{ stages|length }} 个阶段推进，完成后自动跳结果页；错误输入会返回明确原因，不会静默跳过。
+    </p>
+  </div>
+</div>
+
+<div class="alert alert-error" id="error-box" hidden role="alert"></div>
+
+<div class="split">
+  <section class="panel pane-sticky" id="task">
+    <div class="panel-head">
+      <h2>抽检任务</h2>
+      <div class="panel-actions"><span class="tag">{{ stages|length }} 阶段</span></div>
+    </div>
+    <div class="panel-body">
+      <form id="upload-form" data-endpoint="/api/runs/upload" enctype="multipart/form-data">
+        <div class="field">
+          <label for="file">上传 CSV（UTF-8 / GB18030 自动识别）</label>
+          <input type="file" id="file" name="file" accept=".csv,text/csv">
+        </div>
+      </form>
+
+      <div class="field">
+        <label for="ruleset">规则集</label>
+        <select id="ruleset" name="ruleset" disabled>
+          <option>内置规则集 sample_data/rules.json（v{{ rules_version }}）</option>
+        </select>
+        <p class="small muted" style="margin:4px 0 0">
+          规则集唯一版本；改列权重 / 规则权重请到 <a href="/review">复核与工单</a>，保存后重算会立即反映到总分。
+        </p>
+      </div>
+
+      <p class="small muted" style="margin:0 0 8px">
+        规则集要求的列：
+        {% for col in column_specs %}<code>{{ col.name }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
+      </p>
+
+      <details class="help">
+        <summary>或者直接粘贴 CSV 文本</summary>
+        <div class="field" style="margin-top:8px">
+          <label for="csv-text">CSV 文本（含表头）</label>
+          <textarea id="csv-text" placeholder="row_id,product_id,category,price,stock,weight,supplier,updated_at,rating"></textarea>
+        </div>
+        <p class="small muted" style="margin:0">有 <code>row_id</code> 才算一行；缺列会直接 400 并列出缺失的列名。</p>
+      </details>
+
+      <details class="help" style="margin-top:8px">
+        <summary>输入校验与错误恢复口径</summary>
+        <ul class="list small" style="margin:6px 0 0">
+          <li>缺列 → 400：<code>CSV 缺少必需列：price、stock…</code>，页面可直接改文件重试，无需刷新。</li>
+          <li>空文件 / 只有表头 → 400：<code>上传的文件为空</code> / <code>CSV 只有表头、没有数据行</code>。</li>
+          <li>超过 8MB → 400，请分批抽检。</li>
+          <li>上传与粘贴都不写回上游数据，只写本次运行的报告快照。</li>
+        </ul>
+      </details>
+    </div>
+    <div class="panel-actions">
+      <button type="button" id="run-sample" data-endpoint="/api/runs">执行剖析（样例数据）</button>
+      <button type="submit" form="upload-form" class="secondary">上传并执行</button>
+      <button type="button" id="run-text" class="secondary" data-endpoint="/api/runs/text">用粘贴内容执行</button>
+    </div>
+  </section>
+
+  <div>
+    <div class="kpi-strip">
+      <div class="kpi">
+        <div class="k-label">规则集列</div>
+        <div class="k-value">{{ column_specs|length }}</div>
+        <div class="k-note">业务键 {{ business_key|join('+') }}</div>
+      </div>
+      <div class="kpi">
+        <div class="k-label">规则权重项</div>
+        <div class="k-value">{{ rule_weights|length }}</div>
+        <div class="k-note">缺失/类型/范围/异常/重复</div>
+      </div>
+      <div class="kpi">
+        <div class="k-label">剖析阶段</div>
+        <div class="k-value">{{ stages|length }}</div>
+        <div class="k-note">纯函数、顺序固定</div>
+      </div>
+      <div class="kpi">
+        <div class="k-label">历史运行</div>
+        <div class="k-value">{{ history|length }}</div>
+        <div class="k-note">SQLite 命名卷持久化</div>
+      </div>
+      <div class="kpi {% if latest and latest.grade in ['A','B'] %}ok{% elif latest and latest.total_score is not none %}warn{% endif %}">
+        <div class="k-label">最近一次</div>
+        <div class="k-value">
+          {% if latest and latest.total_score is not none %}{{ latest.total_score|num(1) }}{% else %}—{% endif %}
+          {% if latest and latest.grade %}<span class="tag {% if latest.grade == 'A' %}ok{% elif latest.grade == 'B' %}warn{% else %}err{% endif %}">{{ latest.grade }}</span>{% endif %}
+        </div>
+        <div class="k-note">{% if latest %}{{ latest.rows }} 行 · {{ latest.created_at }}{% else %}还没有运行记录{% endif %}</div>
+      </div>
+    </div>
+
+    <section class="panel" id="m1">
+      <div class="panel-head">
+        <h2>列规则与权重（{{ column_specs|length }} 列）</h2>
+        <div class="panel-actions">
+          <span class="tag">权重归一用</span>
+          <a class="btn secondary small" href="/review">改权重</a>
+        </div>
+      </div>
+      <div class="table-wrap roomy">
+        <table class="dense">
+          <thead>
+            <tr><th>列</th><th>含义</th><th>类型</th><th>允许缺失率</th><th>取值范围</th><th>启用规则</th><th>列权重</th></tr>
+          </thead>
+          <tbody>
+            {% for col in column_specs %}
+            <tr>
+              <td><code>{{ col.name }}</code></td>
+              <td>{{ col.label }}</td>
+              <td><span class="tag">{{ col.type }}</span></td>
+              <td>{{ col.max_missing_rate|pct(1) }}</td>
+              <td class="small">{% if col.range %}[{{ col.range.min }}, {{ col.range.max }}]{% else %}—{% endif %}</td>
+              <td class="small">{{ col.rules|join('、') }}</td>
+              <td>{{ col.weight }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-actions">
+        <span class="small muted" style="align-self:center">
+          规则权重：{% for k, v in rule_weights.items() %}{{ rule_labels.get(k, k) }} {{ v }}{% if not loop.last %} · {% endif %}{% endfor %}
+        </span>
+      </div>
+    </section>
+
+    <section class="panel" id="m2">
+      <div class="panel-head">
+        <h2>剖析进度（{{ stages|length }} 个阶段）</h2>
+        <div class="panel-actions"><span class="tag" id="progress-state">待执行</span></div>
+      </div>
+      <div id="progress-card">
+        <div class="panel-body tight">
+          <div class="progress"><div class="progress-bar" id="progress-bar" style="width:0%"></div></div>
+          <p class="small" id="progress-text" style="margin:0">尚未执行：点左侧面板底部「执行剖析（样例数据）」或上传 CSV 开始。</p>
+        </div>
+        <ul class="stages" id="stage-list" style="margin:0;padding:10px 14px 14px">
+          {% for stage in stages %}<li data-stage="{{ loop.index0 }}">{{ stage }}</li>{% endfor %}
+        </ul>
+      </div>
+      <div class="panel-actions">
+        <span class="small muted" style="align-self:center">
+          载入 → 缺失 → 重复 → 异常 → 类型与范围校验 → 加权评分 → 告警合并；每步都是纯函数，同一输入同一分数。
+        </span>
+      </div>
+    </section>
+
+    <section class="panel" id="m3">
+      <div class="panel-head">
+        <h2>重复检测口径</h2>
+        <div class="panel-actions"><span class="tag warn">避免双重扣分</span></div>
+      </div>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead><tr><th>规则</th><th>判定</th><th>计分口径</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>duplicate_key</code></td>
+              <td class="small">业务键 <code>{{ business_key|join(' + ') }}</code> 相同的行归为一组</td>
+              <td class="small">违规数 = 组内额外行数（组大小 − 1）；样本数 = 总行数 − 整行重复行</td>
+            </tr>
+            <tr>
+              <td><code>duplicate_row</code></td>
+              <td class="small">除 <code>row_id</code> 外全部列一致的行归为一组</td>
+              <td class="small">整行级规则，用「（整行）」伪列承载，权重取规则权重</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-actions">
+        <span class="small muted" style="align-self:center">
+          整行重复的行整体归入 <code>duplicate_row</code>，不再重复计入 <code>duplicate_key</code>：同一批行不在两个规则下被扣两次。
+        </span>
+      </div>
+    </section>
+
+    <section class="panel" id="m4">
+      <div class="panel-head">
+        <h2>异常检测参数（IQR + 稳健z 双法）</h2>
+        <div class="panel-actions"><span class="tag">按 {{ group_by }} 分组</span></div>
+      </div>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead><tr><th>参数</th><th>取值</th><th>含义</th></tr></thead>
+          <tbody>
+            <tr><td>分组列</td><td><code>{{ group_by }}</code></td><td class="small">每个品类各自算分位数，小品类不会被大品类规则误判</td></tr>
+            <tr><td>IQR 系数</td><td>{{ outlier.iqr_k }}×IQR</td><td class="small">下界 Q1 − k·IQR，上界 Q3 + k·IQR</td></tr>
+            <tr><td>稳健 z 阈值</td><td>{{ outlier.mad_k }}</td><td class="small">|x − median| / (1.4826·MAD)，MAD 缩放 1.4826</td></tr>
+            <tr><td>组内最小样本</td><td>{{ min_group_sample }}</td><td class="small">组内有效样本 &lt; {{ min_group_sample }} 判 <code>insufficient_sample</code>，不判异常</td></tr>
+            <tr><td>命中分级</td><td>双法 / 单法</td><td class="small">双法同时命中 → <span class="tag err">high</span>；仅一法命中 → <span class="tag warn">medium</span></td></tr>
+            <tr><td>MAD = 0</td><td>跳过稳健 z</td><td class="small">整组取值完全相同（如「食品饮料」重量恒 0.5kg）时不判异常，避免误报</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel" id="m5">
+      <div class="panel-head">
+        <h2>评分卡口径</h2>
+        <div class="panel-actions"><span class="tag">百分制</span></div>
+      </div>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead><tr><th>项</th><th>口径</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td>单项得分</td><td>score = 1 − 违规率</td><td class="small">违规率裁剪到 [0,1]；有效样本为 0 的规则按满分并标注「无样本」</td></tr>
+            <tr><td>权重</td><td>列权重 × 规则权重</td><td class="small">权重只影响归一化分母，不改原始违规判定</td></tr>
+            <tr><td>总分</td><td>100 × Σ(score×weight) / Σweight</td><td class="small">保 2 位小数；权重全为 0 时保护为满分</td></tr>
+            <tr>
+              <td>分级阈值</td><td>A≥{{ thresholds.A }} / B≥{{ thresholds.B }} / C≥{{ thresholds.C }} / D&lt;{{ thresholds.C }}</td>
+              <td class="small">阈值来自 <code>rules.grade_thresholds</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-actions">
+        <span class="small muted" style="align-self:center">改权重后到复核页点「按当前权重重算」，最近一次运行的总分会立即变化。</span>
+        <a class="btn secondary small" href="/review">去改权重并重算</a>
+      </div>
+    </section>
+
+    <section class="panel" id="m6">
+      <div class="panel-head">
+        <h2>工单导出与最近运行</h2>
+        <div class="panel-actions"><span class="tag">{{ history|length }} 次运行</span></div>
+      </div>
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>行数</th><th>总分</th><th>分级</th><th>状态</th><th>工单 CSV</th></tr></thead>
+          <tbody>
+            {% for item in history %}
+            <tr>
+              <td><a href="/result/{{ item.run_id }}">{{ item.run_id }}</a></td>
+              <td class="small muted nowrap">{{ item.created_at }}</td>
+              <td class="small cell-ellipsis">{{ item.source }}</td>
+              <td>{{ item.rows or '—' }}</td>
+              <td>{% if item.total_score is not none %}{{ item.total_score|num(2) }}{% else %}—{% endif %}</td>
+              <td>{% if item.grade %}<span class="tag {% if item.grade == 'A' %}ok{% elif item.grade == 'B' %}warn{% else %}err{% endif %}">{{ item.grade }}</span>{% else %}—{% endif %}</td>
+              <td class="small">{{ item.stage }}</td>
+              <td class="small">{% if item.status == 'done' %}<a href="/api/runs/{{ item.run_id }}/alerts.csv">下载</a>{% else %}—{% endif %}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="8" class="muted">暂无记录。执行一次抽检后，这里会按时间倒序列出运行与工单下载入口。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-actions">
+        <span class="small muted" style="align-self:center">
+          整改工单 CSV 字段：工单号 / row_id / column / rules / severity / 当前值 / 问题说明 / 整改建议；缺失违规按前 20 行逐行 + 其余按列汇总。
+        </span>
+      </div>
+    </section>
+  </div>
+</div>
+{% endblock %}

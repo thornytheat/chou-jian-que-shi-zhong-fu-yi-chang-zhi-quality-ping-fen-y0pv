@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block title %}复核与工单 · {{ app_name }}{% endblock %}
+{% block crumb %}复核与工单{% endblock %}
+{% block meta %}<span class="dot {% if has_overrides %}warn{% else %}ok{% endif %}"></span>
+权重{% if has_overrides %}已覆盖默认值（{{ override_count }} 项）{% else %}为默认值{% endif %} · 运行 {{ history|length }} 次{% endblock %}
+{% block actions %}
+<a class="btn secondary small" href="/workbench">回工作台</a>
+{% if recent %}<a class="btn small" href="/api/runs/{{ recent.run_id }}/alerts.csv">导出工单 CSV</a>{% endif %}
+{% endblock %}
+{% block status_left %}权重只影响归一化分母，不改原始违规判定 · 覆盖写入 SQLite，刷新与重启都保留{% endblock %}
+{% block status_right %}{% if recent %}最近运行 <code>{{ recent.run_id }}</code> · 总分 {{ recent.total_score|num(2) }}（{{ recent.grade }}）{% else %}{{ app_name }}{% endif %}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">复核与工单</h1>
+    <p class="page-sub">
+      三件事：看历史抽检、改权重并用新权重重算最近一次运行、下发整改工单 CSV。
+      权重只影响归一化分母，不改原始违规判定；改完保存后用「按当前权重重算」把最近一次运行重算一遍，分数会立即变化。
+      当前权重{% if has_overrides %}已覆盖默认值 {{ override_count }} 项{% else %}全部为样例默认值{% endif %}。
+    </p>
+  </div>
+</div>
+
+<div class="split result">
+  <div>
+    <section class="panel">
+      <div class="toolbar">
+        <a class="btn secondary small" href="#weight-panel">规则权重编辑</a>
+        <input type="search" id="review-search" placeholder="搜索运行号 / 数据源 / 状态" aria-label="搜索历史运行" style="min-width:200px">
+        <span class="spacer"></span>
+        <span class="small muted" id="review-stat">共 {{ history|length }} 次运行</span>
+        <button type="button" class="btn small secondary" data-export-csv="history-table">导出运行清单</button>
+        {% if recent %}<a class="btn small secondary" href="/api/runs/{{ recent.run_id }}/alerts.csv">导出工单 CSV</a>{% endif %}
+      </div>
+      <div class="table-wrap roomy">
+        <table class="dense" id="history-table">
+          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>行数</th><th>总分</th><th>分级</th><th>状态</th><th>工单</th></tr></thead>
+          <tbody>
+            {% for item in history %}
+            <tr>
+              <td><a href="/result/{{ item.run_id }}">{{ item.run_id }}</a></td>
+              <td class="small muted nowrap">{{ item.created_at }}</td>
+              <td class="small cell-ellipsis">{{ item.source }}</td>
+              <td>{{ item.rows or '—' }}</td>
+              <td>{% if item.total_score is not none %}{{ item.total_score|num(2) }}{% else %}—{% endif %}</td>
+              <td>{% if item.grade %}<span class="tag {% if item.grade == 'A' %}ok{% elif item.grade == 'B' %}warn{% else %}err{% endif %}">{{ item.grade }}</span>{% else %}—{% endif %}</td>
+              <td class="small">{{ item.stage }}</td>
+              <td class="small">{% if item.status == 'done' %}<a href="/api/runs/{{ item.run_id }}/alerts.csv">下载 CSV</a>{% else %}—{% endif %}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="8" class="muted">暂无运行记录。去 <a href="/workbench">工作台</a> 执行一次抽检。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-actions">
+        <span class="small muted" style="align-self:center">
+          历史按时间倒序；「工单」列的 CSV 使用该次运行自己的报告快照，重算后同一 run_id 的工单会跟着更新。
+        </span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>工单字段说明</h2>
+        <div class="panel-actions"><span class="tag">可直接下发上游</span></div>
+      </div>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead><tr><th>列</th><th>含义</th></tr></thead>
+          <tbody>
+            <tr><td><code>工单号</code></td><td>WO-0001 递增，一次导出一套号</td></tr>
+            <tr><td><code>row_id</code></td><td>问题行；整列问题为 <code>—</code>，整行为 <code>（整行）</code> 列</td></tr>
+            <tr><td><code>column</code></td><td>问题列；整行重复为 <code>（整行）</code></td></tr>
+            <tr><td><code>rules</code></td><td>同一单元格命中的全部规则（逗号/顿号分隔），已去重合并</td></tr>
+            <tr><td><code>severity</code></td><td>high / medium，取该单元格所有命中规则里最严重的一档</td></tr>
+            <tr><td><code>当前值 / 问题说明</code></td><td>原始值与判定依据（阈值、中位数、IQR 区间、稳健 z 等）</td></tr>
+            <tr><td><code>整改建议</code></td><td>按规则给出的可执行动作，直接下发上游</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-actions">
+        <span class="small muted" style="align-self:center">
+          缺失违规列按「前 20 行逐行 + 其余按列汇总」输出，避免同一列的 300 行缺失把工单撑爆。
+        </span>
+      </div>
+    </section>
+  </div>
+
+  <div>
+    <section class="panel pane-sticky" id="weight-panel" style="max-height:calc(100vh - 250px)">
+      <div class="panel-head">
+        <h2>权重与阈值编辑</h2>
+        <div class="panel-actions">
+          <span class="tag {% if has_overrides %}warn{% else %}ok{% endif %}">{% if has_overrides %}已覆盖 {{ override_count }} 项{% else %}默认值{% endif %}</span>
+        </div>
+      </div>
+      <div class="panel-body">
+        <form id="weight-form" data-endpoint="/api/rules/weights">
+          <p class="small muted" style="margin:0 0 6px">列权重（0 ~ 10，默认值来自 <code>rules.json</code>）：</p>
+          {% for col in columns %}
+          <div class="field" style="display:grid;grid-template-columns:minmax(0,1fr) 88px;align-items:center;gap:8px;margin-bottom:6px">
+            <label for="w-col-{{ col.name }}" style="margin:0" title="{{ col.label }} · {{ col.name }}">
+              {{ col.label }} <code>{{ col.name }}</code>
+              <span class="muted" style="font-weight:400">默认 {{ col.default }}</span>
+            </label>
+            <input type="number" step="0.1" min="0" max="10" id="w-col-{{ col.name }}" name="col:{{ col.name }}" value="{{ col.value }}">
+          </div>
+          {% endfor %}
+          <p class="small muted" style="margin:12px 0 6px">规则权重（0 ~ 10）：</p>
+          {% for rule in rule_weights %}
+          <div class="field" style="display:grid;grid-template-columns:minmax(0,1fr) 88px;align-items:center;gap:8px;margin-bottom:6px">
+            <label for="w-rule-{{ rule.name }}" style="margin:0">
+              {{ rule.label }} <span class="muted" style="font-weight:400">默认 {{ rule.default }}</span>
+            </label>
+            <input type="number" step="0.1" min="0" max="10" id="w-rule-{{ rule.name }}" name="rule:{{ rule.name }}" value="{{ rule.value }}">
+          </div>
+          {% endfor %}
+        </form>
+
+        <p class="small muted" style="margin:12px 0 4px">分级阈值（只读，来自 <code>rules.grade_thresholds</code>）：</p>
+        <div class="table-wrap auto">
+          <table class="dense">
+            <thead><tr><th>分级</th><th>阈值</th><th>含义</th></tr></thead>
+            <tbody>
+              <tr><td><span class="tag ok">A</span></td><td>≥ {{ thresholds.A }}</td><td class="small">达标，可选择性整改</td></tr>
+              <tr><td><span class="tag warn">B</span></td><td>≥ {{ thresholds.B }}</td><td class="small">基本达标，按工单抽改</td></tr>
+              <tr><td><span class="tag warn">C</span></td><td>≥ {{ thresholds.C }}</td><td class="small">需整改后复检</td></tr>
+              <tr><td><span class="tag err">D</span></td><td>&lt; {{ thresholds.C }}</td><td class="small">整批退回上游重报</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div id="weight-msg" class="alert alert-info" hidden style="margin-top:10px"></div>
+      </div>
+      <div class="panel-actions">
+        <button type="submit" form="weight-form">保存权重</button>
+        <button type="button" id="reset-weights" class="secondary" data-endpoint="/api/rules/weights/reset">恢复默认</button>
+        {% if recent %}<button type="button" id="rescore" class="secondary" data-run="{{ recent.run_id }}">按当前权重重算</button>{% endif %}
+      </div>
+    </section>
+  </div>
+</div>
+{% endblock %}
